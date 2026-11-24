@@ -1,0 +1,15 @@
+[package]
+name = "mlr"
+version = "0.2.0"
+edition = "2021"
+description = "MLR: a high-level language whose semantics are isomorphic to MLIR's IR model"
+license = "MIT"
+
+[[bin]]
+name = "mlr"
+path = "src/main.rs"
+
+[dependencies]
+
+[profile.release]
+opt-level = 2

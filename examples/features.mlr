@@ -1,0 +1,37 @@
+// A tour of the language: regions, loop-carried values, tensor operations
+// and pure functions.
+
+fn fib(n: i32) -> i32 {
+    if n < 2 {
+        yield n
+    } else {
+        yield fib(n - 1) + fib(n - 2)
+    }
+}
+
+fn sum_to(n: i32) -> i32 {
+    yield for i in 0..n step 1 iter(acc = 0) {
+        yield acc + i
+    }
+}
+
+fn dot(a: Tensor<4xf32>, b: Tensor<4xf32>) -> f32 {
+    yield reduce(0.0, a) |acc, v| {
+        yield acc + v
+    }
+}
+
+fn scaled(x: Tensor<4xf32>, s: f32) -> Tensor<4xf32> {
+    yield map(x) {unroll = 2} |v| {
+        yield v * s
+    }
+}
+
+fn main() {
+    print(fib(10))
+    print(sum_to(10))
+    let t = tensor.zeros<Tensor<4xf32>>()
+    let u = scaled(t, 3.0)
+    let e = tensor.extract(u, [2])
+    print(e)
+}

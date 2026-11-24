@@ -1,0 +1,21 @@
+// Tensor values: `map` is a domain operation that keeps its structure
+// until the bufferization stage.
+
+fn scale(x: Tensor<4xf32>, s: f32) -> Tensor<4xf32> {
+    yield map(x) {unroll = 2} |v| {
+        yield v * s
+    }
+}
+
+fn total(x: Tensor<4xf32>) -> f32 {
+    yield reduce(0.0, x) |acc, v| {
+        yield acc + v
+    }
+}
+
+fn main() {
+    let t = tensor.zeros<Tensor<4xf32>>()
+    let u = scale(t, 2.5)
+    let e = tensor.extract(u, [0])
+    print(e)
+}

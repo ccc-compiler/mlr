@@ -1,0 +1,53 @@
+// MNIST: a small convolutional network that classifies handwritten digits.
+//
+// The network was trained with `tools/train_mnist.py` (a plain numpy
+// implementation). The weights and the test images are embedded into the
+// program at compile time with `mlr.load`, so the program is self contained.
+//
+// The convolution and the matrix multiplication are executed by the runtime
+// library, which has a CPU implementation and a Metal Performance Shaders
+// implementation (see `runtime/`).
+
+fn classify(
+    x: Tensor<28x28xf32>,
+    w1: Tensor<4x1x5x5xf32>,
+    b1: Tensor<4xf32>,
+    w2: Tensor<784x32xf32>,
+    b2: Tensor<32xf32>,
+    w3: Tensor<32x10xf32>,
+    b3: Tensor<10xf32>
+) -> i32 {
+    // The convolution, the pooling and the flattening keep the shape of the
+    // tensor, the two dense layers are matrix multiplications.
+    let c1 = relu(conv2d(x, w1, b1))
+    let p1 = maxpool2d(c1, 2)
+    let f1 = flatten(p1)
+    let d1 = relu(add_bias(matmul(f1, w2), b2))
+    let logits = add_bias(matmul(d1, w3), b3)
+    yield argmax(logits)
+}
+
+fn main() {
+    let images = mlr.load<Tensor<100x28x28xf32>>("examples/mnist/images.bin")
+    let labels = mlr.load<Tensor<100xi32>>("examples/mnist/labels.bin")
+    let w1 = mlr.load<Tensor<4x1x5x5xf32>>("examples/mnist/w1.bin")
+    let b1 = mlr.load<Tensor<4xf32>>("examples/mnist/b1.bin")
+    let w2 = mlr.load<Tensor<784x32xf32>>("examples/mnist/w2.bin")
+    let b2 = mlr.load<Tensor<32xf32>>("examples/mnist/b2.bin")
+    let w3 = mlr.load<Tensor<32x10xf32>>("examples/mnist/w3.bin")
+    let b3 = mlr.load<Tensor<10xf32>>("examples/mnist/b3.bin")
+
+    // The loop counts the correctly classified images.
+    let correct = for i in 0..100 step 1 iter(acc = 0) {
+        let img = row(images, i)
+        let pred = classify(img, w1, b1, w2, b2, w3, b3)
+        let label = tensor.extract(labels, [i])
+        if pred == label {
+            yield acc + 1
+        } else {
+            yield acc
+        }
+    }
+    print(correct)
+    print(correct / 100.0)
+}

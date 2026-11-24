@@ -1,0 +1,32 @@
+// A scalar MLR program: regions, yields and structured loops.
+
+fn add(a: i32, b: i32) -> i32 {
+    yield a + b
+}
+
+fn fact(n: i32) -> i32 {
+    if n <= 1 {
+        yield 1
+    } else {
+        yield n * fact(n - 1)
+    }
+}
+
+fn sum_to(n: i32) -> i32 {
+    let total = for i in 0..n step 1 iter(acc = 0) {
+        yield acc + i
+    }
+    yield total
+}
+
+fn main() {
+    print(add(1, 2))
+    print(fact(5))
+    print(sum_to(10))
+    let big = if add(2, 3) > 4 {
+        yield 100
+    } else {
+        yield 200
+    }
+    print(big)
+}
