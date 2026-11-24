@@ -25,6 +25,9 @@ pub enum CType {
         dims: Vec<CDim>,
         elem: Box<CType>,
     },
+    /// A struct by value; the number names the definition in the table of
+    /// the program.
+    Struct(usize),
     /// No value (a region that yields nothing).
     Void,
 }
@@ -85,6 +88,7 @@ impl CType {
             CType::Scalar(k) => k.name().to_string(),
             CType::Index => "index".to_string(),
             CType::Void => "()".to_string(),
+            CType::Struct(_) => "struct".to_string(),
             CType::Tensor { dims, elem } => {
                 let mut s = String::from("Tensor<");
                 for (i, d) in dims.iter().enumerate() {
@@ -235,6 +239,24 @@ pub enum TExpr {
         tensors: Vec<TExpr>,
         keys: Vec<String>,
     },
+    /// A struct value built from its fields, in the order of the definition.
+    Struct {
+        def: usize,
+        fields: Vec<TExpr>,
+        ty: CType,
+    },
+    /// A field of a struct: `recv.field`.
+    Field {
+        recv: Box<TExpr>,
+        index: usize,
+        ty: CType,
+    },
+    /// A functional update: `recv with { field: expr, ... }`.
+    With {
+        recv: Box<TExpr>,
+        updates: Vec<(usize, TExpr)>,
+        ty: CType,
+    },
 }
 
 impl TExpr {
@@ -257,6 +279,9 @@ impl TExpr {
             TExpr::Domain { ty, .. } => ty.clone(),
             TExpr::Load { ty, .. } => ty.clone(),
             TExpr::Save { .. } => CType::Void,
+            TExpr::Struct { ty, .. } => ty.clone(),
+            TExpr::Field { ty, .. } => ty.clone(),
+            TExpr::With { ty, .. } => ty.clone(),
         }
     }
 
@@ -300,8 +325,16 @@ pub struct TFunc {
     pub body: TBlock,
 }
 
+/// A struct definition, with the checked types of its fields.
+#[derive(Clone, Debug)]
+pub struct TStructDef {
+    pub name: String,
+    pub fields: Vec<(String, CType)>,
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct TProgram {
+    pub structs: Vec<TStructDef>,
     pub funcs: Vec<TFunc>,
 }
 
@@ -315,6 +348,12 @@ pub struct Checker {
     sigs: HashMap<String, Sig>,
     scopes: Vec<HashMap<String, CType>>,
     cur_ret: Option<CType>,
+    /// The struct definitions, in the order of their first appearance.
+    structs: Vec<TStructDef>,
+    /// Maps the name of a struct to its index in `structs`.
+    struct_ids: HashMap<String, usize>,
+    /// The first error that a place without a `Result` has seen.
+    error: Option<Error>,
 }
 
 fn err<T>(msg: impl Into<String>, span: &Span) -> Result<T, Error> {
@@ -351,10 +390,55 @@ impl Checker {
             sigs: HashMap::new(),
             scopes: Vec::new(),
             cur_ret: None,
+            structs: Vec::new(),
+            struct_ids: HashMap::new(),
+            error: None,
         }
     }
 
     pub fn check(mut self, prog: &Program) -> Result<TProgram, Error> {
+        // The names of the structs come first, so that the types of their
+        // fields (and of the parameters of the functions) can name them.
+        for s in &prog.structs {
+            if self.struct_ids.contains_key(&s.name) {
+                return err(
+                    format!("duplicate definition of struct `{}`", s.name),
+                    &s.span,
+                );
+            }
+            self.struct_ids
+                .insert(s.name.clone(), self.structs.len());
+            self.structs.push(TStructDef {
+                name: s.name.clone(),
+                fields: Vec::new(),
+            });
+        }
+        // The types of the fields; a struct may only contain scalars, tensors
+        // and other structs.
+        for s in &prog.structs {
+            let id = self.struct_ids[&s.name];
+            let mut fields = Vec::new();
+            for (fname, fty) in &s.fields {
+                let ty = self.resolve(fty, &s.span);
+                if matches!(ty, CType::Void) {
+                    return err(
+                        format!("the field `{}.{}` has no type", s.name, fname),
+                        &s.span,
+                    );
+                }
+                fields.push((fname.clone(), ty));
+            }
+            self.structs[id].fields = fields;
+        }
+        // A struct may not contain itself, directly or indirectly.
+        for (id, s) in prog.structs.iter().enumerate() {
+            if self.reaches(id, id) {
+                return err(
+                    format!("the struct `{}` contains itself", s.name),
+                    &s.span,
+                );
+            }
+        }
         for f in &prog.funcs {
             if self.sigs.contains_key(&f.name) {
                 return err(
@@ -370,23 +454,100 @@ impl Checker {
                 },
             );
         }
+        // The methods are functions with the name of their struct in front.
+        for block in &prog.impls {
+            if !self.struct_ids.contains_key(&block.name) {
+                return err(
+                    format!("`impl` of the unknown struct `{}`", block.name),
+                    &block.span,
+                );
+            }
+            for m in &block.methods {
+                let full = format!("{}.{}", block.name, m.name);
+                if self.sigs.contains_key(&full) {
+                    return err(
+                        format!("duplicate definition of method `{}`", full),
+                        &m.span,
+                    );
+                }
+                self.sigs.insert(
+                    full,
+                    Sig {
+                        params: Vec::new(),
+                        ret: None,
+                    },
+                );
+            }
+        }
         // Signatures need the parameter types, which requires resolving the
         // symbolic dimensions of the parameters first.
         for f in &prog.funcs {
-            let params: Vec<CType> = f.params.iter().map(|p| self.resolve(&p.ty)).collect();
-            let ret = f.ret.as_ref().map(|r| self.resolve(r));
+            let params: Vec<CType> = f
+                .params
+                .iter()
+                .map(|p| self.resolve(&p.ty, &p.span))
+                .collect();
+            let ret = f.ret.as_ref().map(|r| self.resolve(r, &f.span));
             self.sigs.insert(f.name.clone(), Sig { params, ret });
+        }
+        for block in &prog.impls {
+            for m in &block.methods {
+                let full = format!("{}.{}", block.name, m.name);
+                let params: Vec<CType> = m
+                    .params
+                    .iter()
+                    .map(|p| self.resolve(&p.ty, &p.span))
+                    .collect();
+                let ret = m.ret.as_ref().map(|r| self.resolve(r, &m.span));
+                self.sigs.insert(full, Sig { params, ret });
+            }
         }
         let mut out = Vec::new();
         for f in &prog.funcs {
             out.push(self.check_func(f)?);
         }
-        Ok(TProgram { funcs: out })
+        for block in &prog.impls {
+            for m in &block.methods {
+                // A method is a function with the name of its struct in
+                // front, which is how it is called.
+                let mut method = m.clone();
+                method.name = format!("{}.{}", block.name, m.name);
+                out.push(self.check_func(&method)?);
+            }
+        }
+        if let Some(e) = self.error {
+            return Err(e);
+        }
+        Ok(TProgram {
+            structs: self.structs.clone(),
+            funcs: out,
+        })
+    }
+
+    /// Whether the struct `from` has a field of the struct `to`, directly or
+    /// through other structs.
+    fn reaches(&self, from: usize, to: usize) -> bool {
+        for (_, ty) in &self.structs[from].fields {
+            match ty {
+                CType::Struct(next) => {
+                    if *next == to || self.reaches(*next, to) {
+                        return true;
+                    }
+                }
+                CType::Tensor { elem, .. } => {
+                    if matches!(**elem, CType::Struct(_)) {
+                        return true;
+                    }
+                }
+                _ => {}
+            }
+        }
+        false
     }
 
     /// Converts a source type into a checked type, creating fresh symbols for
     /// dynamic dimensions.
-    fn resolve(&mut self, ty: &SrcType) -> CType {
+    fn resolve(&mut self, ty: &SrcType, span: &Span) -> CType {
         match ty {
             SrcType::Scalar(k) => CType::Scalar(*k),
             SrcType::Index => CType::Index,
@@ -398,12 +559,24 @@ impl Checker {
                         SrcDim::Dynamic => CDim::Dynamic,
                     })
                     .collect();
-                let elem = self.resolve(elem);
+                let elem = self.resolve(elem, span);
                 CType::Tensor {
                     dims,
                     elem: Box::new(elem),
                 }
             }
+            SrcType::Named(name) => match self.struct_ids.get(name) {
+                Some(id) => CType::Struct(*id),
+                None => {
+                    if self.error.is_none() {
+                        self.error = Some(Error {
+                            msg: format!("unknown type `{}`", name),
+                            span: span.clone(),
+                        });
+                    }
+                    CType::Void
+                }
+            },
         }
     }
 
@@ -411,11 +584,11 @@ impl Checker {
         self.scopes = vec![HashMap::new()];
         let mut params = Vec::new();
         for p in &f.params {
-            let ty = self.resolve(&p.ty);
+            let ty = self.resolve(&p.ty, &p.span);
             self.scopes[0].insert(p.name.clone(), ty.clone());
             params.push((p.name.clone(), ty));
         }
-        let ret = f.ret.as_ref().map(|r| self.resolve(r));
+        let ret = f.ret.as_ref().map(|r| self.resolve(r, &f.span));
         self.cur_ret = ret.clone();
         let body = self.check_block(&f.body, ret.as_ref())?;
         Ok(TFunc {
@@ -440,7 +613,7 @@ impl Checker {
                     let v = self.check_expr(value)?;
                     let final_ty = match ty {
                         Some(t) => {
-                            let target = self.resolve(t);
+                            let target = self.resolve(t, span);
                             coerce(&v, &target).ok_or_else(|| Error {
                                 msg: format!(
                                     "cannot initialize `{}` of type {} with a value of type {}",
@@ -1030,6 +1203,187 @@ impl Checker {
                     ty,
                 })
             }
+            Expr::Field { recv, name, span } => {
+                let r = self.check_expr(recv)?;
+                let id = self.struct_of(&r.ty(), name, span)?;
+                let index = self.field_index(id, name, span)?;
+                let ty = self.structs[id].fields[index].1.clone();
+                Ok(TExpr::Field {
+                    recv: Box::new(r),
+                    index,
+                    ty,
+                })
+            }
+            Expr::StructLit { name, fields, span } => {
+                let id = self.struct_id(name, span)?;
+                let def = self.structs[id].clone();
+                for (i, (fname, _)) in fields.iter().enumerate() {
+                    if fields[i + 1..].iter().any(|(n, _)| n == fname) {
+                        return err(
+                            format!("duplicate field `{}` in the literal of `{}`", fname, name),
+                            span,
+                        );
+                    }
+                }
+                if fields.len() != def.fields.len() {
+                    return err(
+                        format!(
+                            "the struct `{}` has {} fields, the literal has {}",
+                            name,
+                            def.fields.len(),
+                            fields.len()
+                        ),
+                        span,
+                    );
+                }
+                let mut values = Vec::new();
+                for (fname, fty) in &def.fields {
+                    let expr = fields
+                        .iter()
+                        .find(|(n, _)| n == fname)
+                        .map(|(_, e)| e)
+                        .ok_or_else(|| Error {
+                            msg: format!("the field `{}.{}` is missing", name, fname),
+                            span: span.clone(),
+                        })?;
+                    let v = self.check_expr(expr)?;
+                    let v = coerce(&v, fty).ok_or_else(|| Error {
+                        msg: format!(
+                            "the field `{}.{}` has type {}, found {}",
+                            name,
+                            fname,
+                            fty.print(),
+                            v.ty().print()
+                        ),
+                        span: span.clone(),
+                    })?;
+                    values.push(v);
+                }
+                Ok(TExpr::Struct {
+                    def: id,
+                    fields: values,
+                    ty: CType::Struct(id),
+                })
+            }
+            Expr::With { recv, updates, span } => {
+                let r = self.check_expr(recv)?;
+                let id = self.struct_of(&r.ty(), "the value", span)?;
+                let def = self.structs[id].clone();
+                for (i, (fname, _)) in updates.iter().enumerate() {
+                    if updates[i + 1..].iter().any(|(n, _)| n == fname) {
+                        return err(
+                            format!("duplicate field `{}` in the update", fname),
+                            span,
+                        );
+                    }
+                }
+                let mut ups = Vec::new();
+                for (fname, fexpr) in updates {
+                    let index = self.field_index(id, fname, span)?;
+                    let fty = def.fields[index].1.clone();
+                    let v = self.check_expr(fexpr)?;
+                    let v = coerce(&v, &fty).ok_or_else(|| Error {
+                        msg: format!(
+                            "the field `{}.{}` has type {}, found {}",
+                            def.name,
+                            fname,
+                            fty.print(),
+                            v.ty().print()
+                        ),
+                        span: span.clone(),
+                    })?;
+                    ups.push((index, v));
+                }
+                Ok(TExpr::With {
+                    recv: Box::new(r),
+                    updates: ups,
+                    ty: CType::Struct(id),
+                })
+            }
+            Expr::Method {
+                recv,
+                name,
+                args,
+                span,
+            } => {
+                let r = self.check_expr(recv)?;
+                let id = self.struct_of(&r.ty(), name, span)?;
+                let sname = self.structs[id].name.clone();
+                let full = format!("{}.{}", sname, name);
+                let sig = match self.sigs.get(&full) {
+                    Some(s) => s.clone(),
+                    None => {
+                        return err(
+                            format!("the struct `{}` has no method `{}`", sname, name),
+                            span,
+                        )
+                    }
+                };
+                if sig.params.len() != args.len() + 1 {
+                    return err(
+                        format!(
+                            "the method `{}` expects {} argument(s), found {}",
+                            full,
+                            sig.params.len() - 1,
+                            args.len()
+                        ),
+                        span,
+                    );
+                }
+                let mut targs = vec![coerce(&r, &sig.params[0]).ok_or_else(|| Error {
+                    msg: format!(
+                        "the receiver of `{}` has type {}, expected {}",
+                        full,
+                        r.ty().print(),
+                        sig.params[0].print()
+                    ),
+                    span: span.clone(),
+                })?];
+                for (a, expected) in args.iter().zip(sig.params[1..].iter()) {
+                    let ta = self.check_expr(a)?;
+                    let ta = coerce(&ta, expected).ok_or_else(|| Error {
+                        msg: format!(
+                            "argument of `{}` has type {}, expected {}",
+                            full,
+                            ta.ty().print(),
+                            expected.print()
+                        ),
+                        span: span.clone(),
+                    })?;
+                    targs.push(ta);
+                }
+                Ok(TExpr::Call {
+                    name: full,
+                    type_args: vec![],
+                    args: targs,
+                    ret: sig.ret.unwrap_or(CType::Void),
+                })
+            }
+        }
+    }
+
+    /// The index of the struct that a type names, or an error.
+    fn struct_of(&self, ty: &CType, what: &str, span: &Span) -> Result<usize, Error> {
+        match ty {
+            CType::Struct(id) => Ok(*id),
+            t => err(format!("`{}` is not a struct, found {}", what, t.print()), span),
+        }
+    }
+
+    fn struct_id(&self, name: &str, span: &Span) -> Result<usize, Error> {
+        match self.struct_ids.get(name) {
+            Some(id) => Ok(*id),
+            None => err(format!("unknown struct `{}`", name), span),
+        }
+    }
+
+    fn field_index(&self, id: usize, name: &str, span: &Span) -> Result<usize, Error> {
+        match self.structs[id].fields.iter().position(|(n, _)| n == name) {
+            Some(i) => Ok(i),
+            None => err(
+                format!("the struct `{}` has no field `{}`", self.structs[id].name, name),
+                span,
+            ),
         }
     }
 
@@ -1693,7 +2047,7 @@ impl Checker {
                     Some(Expr::Str(text, _)) => Some(text.clone()),
                     Some(_) => return err("the name of a tensor must be a string", span),
                 };
-                let ty = self.resolve(&type_args[0]);
+                let ty = self.resolve(&type_args[0], span);
                 if !ty.is_tensor() {
                     return err("`mlr.load` expects a tensor type", span);
                 }
@@ -1835,7 +2189,7 @@ impl Checker {
                 if type_args.len() != 1 {
                     return err(format!("`{}` takes exactly one type argument", name), span);
                 }
-                let ty = self.resolve(&type_args[0]);
+                let ty = self.resolve(&type_args[0], span);
                 if !ty.is_tensor() {
                     return err(format!("`{}` expects a tensor type", name), span);
                 }

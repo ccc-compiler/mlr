@@ -22,6 +22,8 @@ pub enum SrcType {
         dims: Vec<SrcDim>,
         elem: Box<SrcType>,
     },
+    /// The name of a struct.
+    Named(String),
 }
 
 impl SrcType {
@@ -50,6 +52,7 @@ impl SrcType {
                 s.push('>');
                 s
             }
+            SrcType::Named(name) => name.clone(),
         }
     }
 }
@@ -160,6 +163,31 @@ pub enum Expr {
         indices: Vec<Box<Expr>>,
         span: Span,
     },
+    /// A field access: `recv.field`.
+    Field {
+        recv: Box<Expr>,
+        name: String,
+        span: Span,
+    },
+    /// A struct literal: `Name { field: expr, ... }`.
+    StructLit {
+        name: String,
+        fields: Vec<(String, Expr)>,
+        span: Span,
+    },
+    /// A functional update: `recv with { field: expr, ... }`.
+    With {
+        recv: Box<Expr>,
+        updates: Vec<(String, Expr)>,
+        span: Span,
+    },
+    /// A method call: `recv.method(args)`.
+    Method {
+        recv: Box<Expr>,
+        name: String,
+        args: Vec<Expr>,
+        span: Span,
+    },
     /// `tensor.insert(tensor, [index], value)` writes into a tensor.
     Insert {
         tensor: Box<Expr>,
@@ -187,6 +215,10 @@ impl Expr {
             | Expr::Reduce { span: s, .. }
             | Expr::Extract { span: s, .. } => s.clone(),
             | Expr::Insert { span: s, .. } => s.clone(),
+            | Expr::Field { span: s, .. }
+            | Expr::StructLit { span: s, .. }
+            | Expr::With { span: s, .. }
+            | Expr::Method { span: s, .. } => s.clone(),
         }
     }
 }
@@ -237,7 +269,26 @@ pub struct Func {
     pub span: Span,
 }
 
+/// A struct definition: `struct Name { field: Type, ... }`.
+#[derive(Clone, Debug)]
+pub struct StructDef {
+    pub name: String,
+    pub fields: Vec<(String, SrcType)>,
+    pub span: Span,
+}
+
+/// An `impl Name { fn ... }` block: the methods of a struct.
+#[derive(Clone, Debug)]
+pub struct ImplBlock {
+    /// The name of the struct.
+    pub name: String,
+    pub methods: Vec<Func>,
+    pub span: Span,
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct Program {
+    pub structs: Vec<StructDef>,
+    pub impls: Vec<ImplBlock>,
     pub funcs: Vec<Func>,
 }

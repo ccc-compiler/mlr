@@ -412,6 +412,185 @@ fn main() {
 }
 
 #[test]
+fn builds_a_struct_and_reads_its_fields() {
+    let mlir = compile(
+        r#"
+struct Vec3 {
+    x: f32,
+    y: f32,
+    z: f32
+}
+
+fn main() {
+    let a = Vec3 { x: 1.0, y: 2.0, z: 3.0 }
+    print(a.y)
+}
+"#,
+    );
+    // The struct is a bundle of three constants.
+    assert!(mlir.contains("arith.constant 2.0"), "{}", mlir);
+    verify_mlir(&mlir);
+}
+
+#[test]
+fn runs_a_program_with_structs_and_methods() {
+    let Some(out) = run(
+        r#"
+struct Vec3 {
+    x: f32,
+    y: f32,
+    z: f32
+}
+
+impl Vec3 {
+    fn dot(self, other: Vec3) -> f32 {
+        yield self.x * other.x + self.y * other.y + self.z * other.z
+    }
+    fn scaled(self, s: f32) -> Vec3 {
+        yield Vec3 { x: self.x * s, y: self.y * s, z: self.z * s }
+    }
+}
+
+fn main() {
+    let a = Vec3 { x: 1.0, y: 2.0, z: 3.0 }
+    let b = Vec3 { x: 4.0, y: 5.0, z: 6.0 }
+    print(a.dot(b))
+    let c = a.scaled(10.0)
+    print(c.x)
+}
+"#,
+    ) else {
+        eprintln!("skipping: the LLVM tool chain is not available");
+        return;
+    };
+    assert_eq!(
+        out.lines().collect::<Vec<_>>(),
+        vec!["32.000000", "10.000000"]
+    );
+}
+
+#[test]
+fn runs_a_loop_that_carries_a_struct() {
+    let Some(out) = run(
+        r#"
+struct Acc {
+    total: f32
+}
+
+fn main() {
+    let start = Acc { total: 1.0 }
+    let r = for i in 0..4 step 1 iter(acc = start) {
+        yield acc with { total: acc.total + 1.0 }
+    }
+    print(r.total)
+}
+"#,
+    ) else {
+        eprintln!("skipping: the LLVM tool chain is not available");
+        return;
+    };
+    assert_eq!(out.lines().collect::<Vec<_>>(), vec!["5.000000"]);
+}
+
+#[test]
+fn rejects_an_unknown_struct_field() {
+    let err = compile_err(
+        r#"
+struct S {
+    x: f32
+}
+
+fn main() {
+    let a = S { x: 1.0 }
+    print(a.y)
+}
+"#,
+    );
+    assert!(err.contains("has no field `y`"), "{}", err);
+}
+
+#[test]
+fn rejects_a_missing_struct_field() {
+    let err = compile_err(
+        r#"
+struct S {
+    x: f32,
+    y: f32
+}
+
+fn main() {
+    let a = S { x: 1.0 }
+}
+"#,
+    );
+    assert!(err.contains("missing") || err.contains("has 2 fields"), "{}", err);
+}
+
+#[test]
+fn rejects_a_wrong_field_type() {
+    let err = compile_err(
+        r#"
+struct S {
+    x: Tensor<4xf32>
+}
+
+fn main() {
+    let t = tensor.zeros<Tensor<8xf32>>()
+    let a = S { x: t }
+}
+"#,
+    );
+    assert!(err.contains("has type"), "{}", err);
+}
+
+#[test]
+fn rejects_a_recursive_struct() {
+    let err = compile_err(
+        r#"
+struct S {
+    x: S
+}
+"#,
+    );
+    assert!(err.contains("contains itself"), "{}", err);
+}
+
+#[test]
+fn rejects_an_unknown_method() {
+    let err = compile_err(
+        r#"
+struct S {
+    x: f32
+}
+
+fn main() {
+    let a = S { x: 1.0 }
+    a.nope()
+}
+"#,
+    );
+    assert!(err.contains("no method `nope`"), "{}", err);
+}
+
+#[test]
+fn rejects_a_struct_without_assignment() {
+    let err = compile_err(
+        r#"
+struct S {
+    x: f32
+}
+
+impl S {
+    fn set(self, v: f32) {
+        self.x = v
+    }
+}
+"#,
+    );
+    assert!(err.contains("error"), "{}", err);
+}
+
+#[test]
 fn runs_the_mnist_example_on_the_cpu() {
     let Some(out) = run_script("scripts/run.sh", "examples/mnist/mnist.mlr") else {
         eprintln!("skipping: the LLVM tool chain is not available");

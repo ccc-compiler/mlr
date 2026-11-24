@@ -59,6 +59,7 @@ func.func @sum_to(%arg0: i32) -> i32 {
 | `index`               | `index`             |
 | `Tensor<64x128xf32>`  | `tensor<64x128xf32>` |
 | `Tensor<?xf32>`       | `tensor<?xf32>`     |
+| a struct type         | the values of its fields |
 
 Integer literals default to `i32`, floating point literals to `f64`; a literal
 is converted to the type of the other operand when the two meet. `index` and
@@ -78,6 +79,53 @@ fn name(a: i32, b: f32) -> i32 {
 ```
 
 The result type may be omitted; the function then returns nothing.
+
+## Structs
+
+```
+struct Attention {
+    wq: Tensor<32x16xf32>,
+    wk: Tensor<32x16xf32>,
+    wv: Tensor<32x16xf32>
+}
+
+struct Block {
+    ln_g: Tensor<32xf32>,
+    attn: Attention,
+    fc1: Tensor<32x128xf32>,
+    fc2: Tensor<128x32xf32>
+}
+
+impl Block {
+    fn forward(self, x: Tensor<16x32xf32>) -> Tensor<16x32xf32> {
+        let h = layernorm(x, self.ln_g, self.ln_g)
+        let m = self.attn.forward(h)
+        ...
+    }
+}
+
+fn main() {
+    let block = Block { ln_g: g, attn: attn, fc1: f1, fc2: f2 }
+    let y = block.forward(x)
+    let other = block with { fc2: new_fc2 }
+}
+```
+
+* A struct bundles values under a name; a field is a scalar, a tensor or
+  another struct (but never the struct itself).
+* The literal `Name { field: expr, ... }` names every field exactly once.
+* `recv.field` reads a field, through any nesting depth.
+* `recv with { field: expr }` is a functional update: it produces a new value
+  and leaves `recv` untouched.
+* A method is declared in an `impl` block; its first parameter is `self`.
+  `recv.method(args)` calls it, which is the same as a function call
+  `Struct.method(recv, args)`. Since values cannot be assigned to, a method
+  never writes into `self`: it yields a new value instead.
+* A struct may flow through `let`, function calls, `if` and loop-carried
+  `iter` values; the compiler flattens it into the values of its fields at
+  the boundaries, so the runtime interface does not change.
+
+See [struct.md](struct.md) for the design notes.
 
 ## Statements and expressions
 

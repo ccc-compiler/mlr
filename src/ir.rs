@@ -99,6 +99,8 @@ pub enum Type {
     },
     /// The type of a function without results.
     Void,
+    /// A tuple of values, used for the type of a struct value.
+    Tuple(Vec<Type>),
 }
 
 #[allow(dead_code)]
@@ -183,6 +185,16 @@ impl Type {
                 }
                 out.push('x');
                 elem.print(out);
+                out.push('>');
+            }
+            Type::Tuple(types) => {
+                out.push_str("tuple<");
+                for (i, t) in types.iter().enumerate() {
+                    if i > 0 {
+                        out.push_str(", ");
+                    }
+                    t.print(out);
+                }
                 out.push('>');
             }
         }
@@ -318,44 +330,24 @@ impl Attr {
                 out.push(']');
             }
             Attr::DenseF32(values) => {
-                if values.len() <= 8 {
-                    out.push_str("dense<[");
-                    for (i, v) in values.iter().enumerate() {
-                        if i > 0 {
-                            out.push_str(", ");
-                        }
-                        let _ = write!(out, "{:?}", v);
+                // The raw bytes: a list literal would only fit a rank of one,
+                // since the type of the tensor is unknown here.
+                out.push_str("dense<\"0x");
+                for v in values {
+                    for byte in v.to_le_bytes() {
+                        let _ = write!(out, "{:02X}", byte);
                     }
-                    out.push_str("]>");
-                } else {
-                    out.push_str("dense<\"0x");
-                    for v in values {
-                        for byte in v.to_le_bytes() {
-                            let _ = write!(out, "{:02X}", byte);
-                        }
-                    }
-                    out.push_str("\">");
                 }
+                out.push_str("\">");
             }
             Attr::DenseI32(values) => {
-                if values.len() <= 8 {
-                    out.push_str("dense<[");
-                    for (i, v) in values.iter().enumerate() {
-                        if i > 0 {
-                            out.push_str(", ");
-                        }
-                        let _ = write!(out, "{}", v);
+                out.push_str("dense<\"0x");
+                for v in values {
+                    for byte in v.to_le_bytes() {
+                        let _ = write!(out, "{:02X}", byte);
                     }
-                    out.push_str("]>");
-                } else {
-                    out.push_str("dense<\"0x");
-                    for v in values {
-                        for byte in v.to_le_bytes() {
-                            let _ = write!(out, "{:02X}", byte);
-                        }
-                    }
-                    out.push_str("\">");
                 }
+                out.push_str("\">");
             }
             Attr::DenseI8(values) => {
                 out.push_str("dense<\"0x");
@@ -984,6 +976,24 @@ impl Printer {
                     }
                 }
             }
+            "func.call" if op.results.len() > 1 => {
+                // The custom syntax of `func.call` has no form for several
+                // results, so the generic one is used.
+                self.results_prefix(out, op);
+                out.push_str("\"func.call\"(");
+                self.value_list(out, &op.operands);
+                out.push_str(") {callee = @");
+                if let Some(Attr::Str(callee)) = op.attr("callee") {
+                    out.push_str(callee);
+                }
+                out.push_str("} : (");
+                let types: Vec<Type> = op.operands.iter().map(|o| o.ty.clone()).collect();
+                self.type_list(out, &types);
+                out.push_str(") -> (");
+                let types: Vec<Type> = op.results.iter().map(|o| o.ty.clone()).collect();
+                self.type_list(out, &types);
+                out.push(')');
+            }
             "func.call" => {
                 self.results_prefix(out, op);
                 out.push_str("func.call @");
@@ -1020,8 +1030,13 @@ impl Printer {
                     out.push(' ');
                     self.value_list(out, &op.operands);
                     out.push_str(" : ");
-                    if let Some(o) = op.operands.first() {
-                        o.ty.print(out);
+                    if op.operands.len() == 1 {
+                        if let Some(o) = op.operands.first() {
+                            o.ty.print(out);
+                        }
+                    } else {
+                        let types: Vec<Type> = op.operands.iter().map(|o| o.ty.clone()).collect();
+                        self.type_list(out, &types);
                     }
                 }
             }

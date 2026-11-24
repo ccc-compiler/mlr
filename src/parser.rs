@@ -96,12 +96,62 @@ impl Parser {
     pub fn parse_program(&mut self) -> PResult<Program> {
         let mut prog = Program::default();
         while !matches!(self.peek(), Tok::Eof) {
-            prog.funcs.push(self.parse_func()?);
+            if self.at_kw("struct") {
+                prog.structs.push(self.parse_struct()?);
+            } else if self.at_kw("impl") {
+                prog.impls.push(self.parse_impl()?);
+            } else {
+                prog.funcs.push(self.parse_func()?);
+            }
         }
         Ok(prog)
     }
 
+    /// `struct Name { field: Type, ... }`
+    fn parse_struct(&mut self) -> PResult<StructDef> {
+        let span = self.expect_kw("struct")?;
+        let (name, _) = self.expect_ident()?;
+        self.expect_punct("{")?;
+        let mut fields = Vec::new();
+        if !self.at_punct("}") {
+            loop {
+                let (fname, _) = self.expect_ident()?;
+                self.expect_punct(":")?;
+                let ty = self.parse_type()?;
+                fields.push((fname, ty));
+                if !self.eat_punct(",") {
+                    break;
+                }
+            }
+        }
+        self.expect_punct("}")?;
+        Ok(StructDef { name, fields, span })
+    }
+
+    /// `impl Name { fn method(self, ...) { ... } ... }`
+    fn parse_impl(&mut self) -> PResult<ImplBlock> {
+        let span = self.expect_kw("impl")?;
+        let (name, _) = self.expect_ident()?;
+        self.expect_punct("{")?;
+        let mut methods = Vec::new();
+        while !self.at_punct("}") {
+            methods.push(self.parse_func_in_impl(&name)?);
+        }
+        self.expect_punct("}")?;
+        Ok(ImplBlock { name, methods, span })
+    }
+
     fn parse_func(&mut self) -> PResult<Func> {
+        self.parse_func_inner(None)
+    }
+
+    /// A method of an impl block: its first parameter may be a bare `self`,
+    /// whose type is the struct of the impl.
+    fn parse_func_in_impl(&mut self, struct_name: &str) -> PResult<Func> {
+        self.parse_func_inner(Some(struct_name))
+    }
+
+    fn parse_func_inner(&mut self, in_impl: Option<&str>) -> PResult<Func> {
         let span = self.expect_kw("fn")?;
         let (name, _) = self.expect_ident()?;
         self.expect_punct("(")?;
@@ -109,8 +159,12 @@ impl Parser {
         if !self.at_punct(")") {
             loop {
                 let (pname, pspan) = self.expect_ident()?;
-                self.expect_punct(":")?;
-                let ty = self.parse_type()?;
+                let ty = if pname == "self" && in_impl.is_some() && !self.at_punct(":") {
+                    SrcType::Named(in_impl.unwrap().to_string())
+                } else {
+                    self.expect_punct(":")?;
+                    self.parse_type()?
+                };
                 params.push(Param {
                     name: pname,
                     ty,
@@ -195,10 +249,8 @@ impl Parser {
             _ => match crate::ir::Type::scalar(&name) {
                 Some(crate::ir::Type::Scalar(k)) => Ok(SrcType::Scalar(k)),
                 Some(crate::ir::Type::Index) => Ok(SrcType::Index),
-                _ => Err(Error {
-                    msg: format!("unknown type `{}`", name),
-                    span,
-                }),
+                // The name of a struct; the checker knows whether it exists.
+                _ => Ok(SrcType::Named(name)),
             },
         }
     }
@@ -292,7 +344,35 @@ impl Parser {
     // -----------------------------------------------------------------
 
     fn parse_expr(&mut self) -> PResult<Expr> {
-        self.parse_or()
+        let e = self.parse_or()?;
+        self.parse_with(e)
+    }
+
+    /// A functional struct update: `expr with { field: expr, ... }`.
+    fn parse_with(&mut self, recv: Expr) -> PResult<Expr> {
+        if !self.at_kw("with") {
+            return Ok(recv);
+        }
+        let span = self.bump().span;
+        self.expect_punct("{")?;
+        let mut updates = Vec::new();
+        if !self.at_punct("}") {
+            loop {
+                let (fname, _) = self.expect_ident()?;
+                self.expect_punct(":")?;
+                let value = self.parse_expr()?;
+                updates.push((fname, value));
+                if !self.eat_punct(",") {
+                    break;
+                }
+            }
+        }
+        self.expect_punct("}")?;
+        Ok(Expr::With {
+            recv: Box::new(recv),
+            updates,
+            span,
+        })
     }
 
     fn parse_or(&mut self) -> PResult<Expr> {
@@ -421,6 +501,10 @@ impl Parser {
             }
             Tok::Ident(first) => {
                 self.bump();
+                // A struct literal: `Name { field: expr, ... }`.
+                if self.at_punct("{") && self.looks_like_struct_lit() {
+                    return self.parse_struct_lit(first, span);
+                }
                 // Dotted names: `tensor.empty`.
                 let mut name = first;
                 while self.at_punct(".") {
@@ -465,23 +549,141 @@ impl Parser {
                         }
                     }
                     self.expect_punct(")")?;
-                    return Ok(Expr::Call {
+                    if name.contains('.')
+                        && !name.starts_with("mlr.")
+                        && !name.starts_with("tensor.")
+                    {
+                        // A method call on a field chain: `s.attn.forward(..)`.
+                        let mut parts = name.split('.');
+                        let first = parts.next().unwrap().to_string();
+                        let mut recv = Expr::Var(first, span.clone());
+                        for part in parts {
+                            recv = Expr::Field {
+                                recv: Box::new(recv),
+                                name: part.to_string(),
+                                span: span.clone(),
+                            };
+                        }
+                        let Expr::Field {
+                            recv: inner,
+                            name: method,
+                            ..
+                        } = recv
+                        else {
+                            unreachable!()
+                        };
+                        let e = Expr::Method {
+                            recv: inner,
+                            name: method,
+                            args,
+                            span: span.clone(),
+                        };
+                        return self.parse_postfix(e);
+                    }
+                    let e = Expr::Call {
                         name,
                         type_args,
                         args,
-                        span,
-                    });
+                        span: span.clone(),
+                    };
+                    return self.parse_postfix(e);
                 }
-                Ok(Expr::Var(name, span))
+                let e = if name.contains('.') {
+                    // A field chain: `block.attn.wq`.
+                    let mut parts = name.split('.');
+                    let first = parts.next().unwrap().to_string();
+                    let mut e = Expr::Var(first, span.clone());
+                    for part in parts {
+                        e = Expr::Field {
+                            recv: Box::new(e),
+                            name: part.to_string(),
+                            span: span.clone(),
+                        };
+                    }
+                    e
+                } else {
+                    Expr::Var(name, span.clone())
+                };
+                self.parse_postfix(e)
             }
             Tok::Punct("(") => {
                 self.bump();
                 let e = self.parse_expr()?;
                 self.expect_punct(")")?;
-                Ok(e)
+                self.parse_postfix(e)
             }
             other => self.err(format!("expected expression, found {}", other)),
         }
+    }
+
+    /// The postfix operations on a value: a field access (`recv.field`), a
+    /// method call (`recv.method(args)`) and a functional update
+    /// (`recv with { field: expr, ... }`).
+    fn parse_postfix(&mut self, mut e: Expr) -> PResult<Expr> {
+        loop {
+            if self.at_punct(".") {
+                let span = self.bump().span;
+                let (name, _) = self.expect_ident()?;
+                if self.at_punct("(") {
+                    self.bump();
+                    let mut args = Vec::new();
+                    if !self.at_punct(")") {
+                        loop {
+                            args.push(self.parse_expr()?);
+                            if !self.eat_punct(",") {
+                                break;
+                            }
+                        }
+                    }
+                    self.expect_punct(")")?;
+                    e = Expr::Method {
+                        recv: Box::new(e),
+                        name,
+                        args,
+                        span,
+                    };
+                } else {
+                    e = Expr::Field {
+                        recv: Box::new(e),
+                        name,
+                        span,
+                    };
+                }
+            } else if self.at_kw("with") {
+                e = self.parse_with(e)?;
+            } else {
+                break;
+            }
+        }
+        Ok(e)
+    }
+
+    /// Whether the `{` at the current position starts a struct literal, that
+    /// is, whether it is followed by `field:` or by `}`.
+    fn looks_like_struct_lit(&self) -> bool {
+        match self.peek_at(1) {
+            Tok::Punct("}") => true,
+            Tok::Ident(_) => matches!(self.peek_at(2), Tok::Punct(":")),
+            _ => false,
+        }
+    }
+
+    fn parse_struct_lit(&mut self, name: String, span: crate::lexer::Span) -> PResult<Expr> {
+        self.expect_punct("{")?;
+        let mut fields = Vec::new();
+        if !self.at_punct("}") {
+            loop {
+                let (fname, _) = self.expect_ident()?;
+                self.expect_punct(":")?;
+                let value = self.parse_expr()?;
+                fields.push((fname, value));
+                if !self.eat_punct(",") {
+                    break;
+                }
+            }
+        }
+        self.expect_punct("}")?;
+        Ok(Expr::StructLit { name, fields, span })
     }
 
     fn parse_if(&mut self) -> PResult<Expr> {

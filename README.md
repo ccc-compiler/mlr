@@ -133,6 +133,7 @@ See [doc/mlr.md](doc/mlr.md) for the details.
 * [doc/mlr.md](doc/mlr.md) — the language specification
 * [doc/architecture.md](doc/architecture.md) — the compiler and its lowering
   pipeline
+* [doc/struct.md](doc/struct.md) — the design of the struct types
 
 ## Layout
 

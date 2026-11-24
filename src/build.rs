@@ -15,6 +15,9 @@ pub fn ir_type(t: &CType) -> Type {
         CType::Scalar(k) => Type::Scalar(*k),
         CType::Index => Type::Index,
         CType::Void => Type::Void,
+        // Structs never reach the IR as one value: they are bundles of the
+        // values of their fields (see `IrBuilder::ty`).
+        CType::Struct(_) => Type::Void,
         CType::Tensor { dims, elem } => {
             let shape = dims
                 .iter()
@@ -58,6 +61,12 @@ pub struct IrBuilder {
     pub runtime: Vec<String>,
     /// Errors that were collected while building the IR.
     pub errors: Vec<String>,
+    /// The struct definitions of the program.
+    structs: Vec<crate::check::TStructDef>,
+    /// A struct value is a bundle of the values of its fields: this maps the
+    /// id of the value that stands for the bundle to the values of its
+    /// fields, flattened in the order of the definitions.
+    struct_vals: HashMap<usize, Vec<Value>>,
 }
 
 impl IrBuilder {
@@ -70,6 +79,8 @@ impl IrBuilder {
             cur_loc: Loc::default(),
             runtime: Vec::new(),
             errors: Vec::new(),
+            structs: Vec::new(),
+            struct_vals: HashMap::new(),
         }
     }
 
@@ -98,7 +109,74 @@ impl IrBuilder {
     }
 
     fn ty(&self, t: &CType) -> Type {
-        ir_type(t)
+        match t {
+            // A struct is a bundle of the values of its fields; its type in
+            // the IR is the tuple of the types of the fields, flattened.
+            CType::Struct(id) => {
+                let mut fields = Vec::new();
+                for (_, f) in &self.structs[*id].fields {
+                    for l in self.flat(f) {
+                        fields.push(l);
+                    }
+                }
+                Type::Tuple(fields)
+            }
+            t => ir_type(t),
+        }
+    }
+
+    /// The types of the leaves of a type: a struct contributes the types of
+    /// its fields, in order.
+    fn flat(&self, t: &CType) -> Vec<Type> {
+        match t {
+            CType::Struct(id) => {
+                let mut out = Vec::new();
+                for (_, f) in &self.structs[*id].fields {
+                    out.extend(self.flat(f));
+                }
+                out
+            }
+            t => vec![self.ty(t)],
+        }
+    }
+
+    /// The number of the leaves of a type.
+    fn leaf_count(&self, t: &CType) -> usize {
+        self.flat(t).len()
+    }
+
+    /// The position of the first leaf of a field among the leaves of its
+    /// struct.
+    fn leaf_offset(&self, def: usize, field: usize) -> usize {
+        let mut off = 0;
+        for (i, (_, f)) in self.structs[def].fields.iter().enumerate() {
+            if i == field {
+                return off;
+            }
+            off += self.leaf_count(f);
+        }
+        off
+    }
+
+    /// The values that a value stands for: the fields of a struct, or the
+    /// value itself.
+    fn leaves(&self, v: &Value) -> Vec<Value> {
+        match self.struct_vals.get(&v.id) {
+            Some(leaves) => leaves.clone(),
+            None => vec![v.clone()],
+        }
+    }
+
+    /// Bundles the leaves into a value that stands for a struct.
+    fn bundle(&mut self, leaves: Vec<Value>, ty: &CType) -> Value {
+        if matches!(ty, CType::Struct(_)) {
+            let marker = self.fresh(self.ty(ty));
+            self.struct_vals.insert(marker.id, leaves);
+            marker
+        } else {
+            debug_assert_eq!(leaves.len(), 1);
+            leaves.into_iter().next().unwrap()
+        }
     }
 
     // -----------------------------------------------------------------
@@ -106,6 +184,7 @@ impl IrBuilder {
     // -----------------------------------------------------------------
 
     pub fn build_program(&mut self, prog: &TProgram) -> ir::Module {
+        self.structs = prog.structs.clone();
         let mut module = ir::Module::default();
         for f in &prog.funcs {
             module.funcs.push(self.build_func(f));
@@ -134,13 +213,28 @@ impl IrBuilder {
     fn build_func(&mut self, f: &TFunc) -> ir::FuncOp {
         self.scopes.clear();
         self.scopes.push(HashMap::new());
+        // A parameter of struct type becomes one parameter per field: the IR
+        // signature is the flatten of the type. The name stands for a bundle
+        // of the parameters, so that the body can use it as one value.
         let mut params = Vec::new();
         for (name, ty) in &f.params {
-            let v = self.fresh(self.ty(ty));
-            self.define(name, v.clone());
-            params.push(v);
+            if let CType::Struct(_) = ty {
+                let leaves: Vec<Value> = self.flat(ty).into_iter().map(|t| self.fresh(t)).collect();
+                params.extend(leaves.iter().cloned());
+                let marker = self.fresh(self.ty(ty));
+                self.struct_vals.insert(marker.id, leaves);
+                self.define(name, marker);
+            } else {
+                let v = self.fresh(self.ty(ty));
+                self.define(name, v.clone());
+                params.push(v);
+            }
         }
-        let mut results: Vec<Type> = f.ret.as_ref().map(|t| vec![self.ty(t)]).unwrap_or_default();
+        let mut results: Vec<Type> = f
+            .ret
+            .as_ref()
+            .map(|t| self.flat(t))
+            .unwrap_or_default();
         // The entry point of the program is `main` of the C runtime, so it
         // returns an exit code of zero even when the program has none.
         let returns_exit_code = f.name == "main" && results.is_empty();
@@ -170,6 +264,15 @@ impl IrBuilder {
                     let v = self.fresh(results[0].clone());
                     zero.results.push(v.clone());
                     ops.push(zero);
+                    term.operands.push(v);
+                }
+            }
+        } else if results.len() > 1 {
+            if yields.len() == results.len() {
+                term.operands = yields;
+            } else {
+                for t in &results {
+                    let v = self.fresh(t.clone());
                     term.operands.push(v);
                 }
             }
@@ -225,9 +328,10 @@ impl IrBuilder {
             for v in values {
                 let val = self.expr(v);
                 // A region that yields a value without one (a `print` call)
-                // contributes nothing to the terminator.
+                // contributes nothing to the terminator. A struct contributes
+                // the values of its fields.
                 if val.ty != Type::Void {
-                    yielded.push(val);
+                    yielded.extend(self.leaves(&val));
                 }
             }
         }
@@ -493,6 +597,50 @@ impl IrBuilder {
                 self.emit(o);
                 res
             }
+            TExpr::Struct { def, fields, ty } => {
+                let mut leaves = Vec::new();
+                for f in fields {
+                    let v = self.expr(f);
+                    leaves.extend(self.leaves(&v));
+                }
+                debug_assert_eq!(leaves.len(), self.leaf_count(ty));
+                let marker = self.fresh(self.ty(ty));
+                self.struct_vals.insert(marker.id, leaves);
+                let _ = def;
+                marker
+            }
+            TExpr::Field { recv, index, ty } => {
+                let r = self.expr(recv);
+                let leaves = self.leaves(&r);
+                let def = match recv.ty() {
+                    CType::Struct(id) => id,
+                    _ => unreachable!("a field access on a non struct"),
+                };
+                let off = self.leaf_offset(def, *index);
+                let count = match ty {
+                    CType::Struct(_) => self.leaf_count(ty),
+                    _ => 1,
+                };
+                let picked: Vec<Value> = leaves[off..off + count].to_vec();
+                self.bundle(picked, ty)
+            }
+            TExpr::With { recv, updates, ty } => {
+                let r = self.expr(recv);
+                let mut leaves = self.leaves(&r);
+                let def = match recv.ty() {
+                    CType::Struct(id) => id,
+                    _ => unreachable!("an update of a non struct"),
+                };
+                for (index, value) in updates {
+                    let off = self.leaf_offset(def, *index);
+                    let v = self.expr(value);
+                    let new_leaves = self.leaves(&v);
+                    for (i, l) in new_leaves.into_iter().enumerate() {
+                        leaves[off + i] = l;
+                    }
+                }
+                self.bundle(leaves, ty)
+            }
             TExpr::Save {
                 path,
                 tensors,
@@ -731,7 +879,8 @@ impl IrBuilder {
         let mut o = Op::new("func.call");
         o.attrs.push(("callee".into(), Attr::Str(name.into())));
         for a in args {
-            o.operands.push(self.expr(a));
+            let v = self.expr(a);
+            o.operands.extend(self.leaves(&v));
         }
         // The type checker knows the result type of every call.
         let ret = match ret {
@@ -740,10 +889,15 @@ impl IrBuilder {
         };
         match ret {
             Some(t) => {
-                let res = self.fresh(self.ty(&t));
-                o.results.push(res.clone());
+                // A struct result is the bundle of the results of the call.
+                let leaves: Vec<Value> = self
+                    .flat(&t)
+                    .into_iter()
+                    .map(|ty| self.fresh(ty))
+                    .collect();
+                o.results = leaves.clone();
                 self.emit(o);
-                res
+                self.bundle(leaves, &t)
             }
             None => {
                 self.emit(o);
@@ -861,17 +1015,26 @@ impl IrBuilder {
     ) -> Value {
         let c = self.expr(cond);
         let yields_value = !matches!(ty, CType::Void);
-        let (then_ops, _) = self.build_block(then_block, if yields_value { 1 } else { 0 });
-        let (else_ops, _) = match else_block {
+        let (then_ops, _then_yields) =
+            self.build_block(then_block, if yields_value { 1 } else { 0 });
+        let (else_ops, _else_yields) = match else_block {
             Some(b) => self.build_block(b, if yields_value { 1 } else { 0 }),
             None => (vec![Op::new("scf.yield")], vec![]),
         };
         let mut o = Op::new("scf.if");
         o.operands.push(c);
-        let res = self.fresh(self.ty(ty));
-        if yields_value {
-            o.results.push(res.clone());
-        }
+        // A struct value is the bundle of the results of the branches.
+        let leaves: Vec<Value> = if yields_value {
+            self.flat(ty).into_iter().map(|t| self.fresh(t)).collect()
+        } else {
+            Vec::new()
+        };
+        o.results = leaves.clone();
+        let res = if yields_value {
+            self.bundle(leaves.clone(), ty)
+        } else {
+            self.fresh(Type::Void)
+        };
         o.regions.push(Region {
             blocks: vec![ir::Block {
                 args: vec![],
@@ -908,35 +1071,46 @@ impl IrBuilder {
         o.operands.push(ub);
         o.operands.push(step);
         let iv = self.fresh(Type::Index);
+        // A loop-carried value of struct type is one iter arg per field.
         let mut iter_args = Vec::new();
+        let mut iter_leaves: Vec<Vec<Value>> = Vec::new();
         for it in iter {
             let init = self.expr(&it.init);
-            o.operands.push(init);
-            let arg = self.fresh(self.ty(&it.ty));
-            iter_args.push((it.name.clone(), arg));
+            let leaves = self.leaves(&init);
+            for l in &leaves {
+                o.operands.push(l.clone());
+            }
+            let args: Vec<Value> = leaves.iter().map(|l| self.fresh(l.ty.clone())).collect();
+            iter_leaves.push(args.clone());
+            iter_args.push(it.name.clone());
         }
         self.scopes.push(HashMap::new());
         self.scopes
             .last_mut()
             .unwrap()
             .insert(var.to_string(), iv.clone());
-        for (name, arg) in &iter_args {
+        for (it, args) in iter.iter().zip(iter_leaves.iter()) {
+            let marker = self.bundle(args.clone(), &it.ty);
             self.scopes
                 .last_mut()
                 .unwrap()
-                .insert(name.clone(), arg.clone());
+                .insert(it.name.clone(), marker);
         }
         let (body_ops, _) = self.build_block(body, iter.len());
         self.scopes.pop();
 
         let mut results = Vec::new();
-        for it in iter {
-            let res = self.fresh(self.ty(&it.ty));
-            results.push(res.clone());
-            o.results.push(res);
+        let mut result_leaves: Vec<Vec<Value>> = Vec::new();
+        for (_, args) in iter.iter().zip(iter_leaves.iter()) {
+            let leaves: Vec<Value> = args.iter().map(|a| self.fresh(a.ty.clone())).collect();
+            results.extend(leaves.iter().cloned());
+            o.results.extend(leaves.iter().cloned());
+            result_leaves.push(leaves);
         }
         let mut args = vec![iv];
-        args.extend(iter_args.iter().map(|(_, a)| a.clone()));
+        for leaves in &iter_leaves {
+            args.extend(leaves.iter().cloned());
+        }
         o.regions.push(Region {
             blocks: vec![ir::Block {
                 args,
@@ -944,10 +1118,11 @@ impl IrBuilder {
             }],
         });
         self.emit(o);
-        if results.is_empty() {
-            self.fresh(Type::Void)
+        // The value of the loop is the first loop-carried value.
+        if let Some((it, leaves)) = iter.first().zip(result_leaves.first()) {
+            self.bundle(leaves.clone(), &it.ty)
         } else {
-            results[0].clone()
+            self.fresh(Type::Void)
         }
     }
 
@@ -1138,6 +1313,11 @@ fn body_is_impure(block: &TBlock) -> bool {
                 tensor, indices, ..
             } => expr_impure(tensor) || indices.iter().any(expr_impure),
             TExpr::Save { tensors, .. } => tensors.iter().any(expr_impure),
+            TExpr::Struct { fields, .. } => fields.iter().any(expr_impure),
+            TExpr::Field { recv, .. } => expr_impure(recv),
+            TExpr::With { recv, updates, .. } => {
+                expr_impure(recv) || updates.iter().any(|(_, v)| expr_impure(v))
+            }
             _ => false,
         }
     }

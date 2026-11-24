@@ -7,50 +7,15 @@
 // compile time with `mlr.load`.
 //
 // The corpus is read as bytes, so the generated text is written byte by byte
-// with `print_byte`.
+// with `print_byte`. The weights of a layer are bundled into a `struct`, so
+// that the forward pass reads like the model and not like a list of sixteen
+// parameters.
 //
 //   attention    p = softmax((q k^T / sqrt(d)) masked) v
 //   head h       out_h = p_h v_h, merged = sum_h out_h proj_h
 //   block        x = x + attn(ln1 x), x = x + fc2 gelu(fc1 ln2 x)
 
-// The causal mask: the scores of the future are set to a large negative
-// number, so that the softmax ignores them.
-fn causal(s: Tensor<16x16xf32>) -> Tensor<16x16xf32> {
-    yield for i in 0..16 step 1 iter(m = s) {
-        yield for j in 0..16 step 1 iter(m2 = m) {
-            if j > i {
-                yield tensor.insert(m2, [i, j], -1000000.0)
-            } else {
-                yield m2
-            }
-        }
-    }
-}
-
-// One attention head: the masked scores and the weighted values.
-fn attention(
-    x: Tensor<16x32xf32>,
-    wq: Tensor<32x16xf32>,
-    wk: Tensor<32x16xf32>,
-    wv: Tensor<32x16xf32>
-) -> Tensor<16x16xf32> {
-    let q = matmul(x, wq)
-    let k = matmul(x, wk)
-    let v = matmul(x, wv)
-    let scaled = map(matmul(q, transpose(k))) |e| {
-        yield e * 0.25
-    }
-    let p = softmax_causal(causal(scaled), 16)
-    yield matmul(p, v)
-}
-
-// One transformer block.
-fn block(
-    x: Tensor<16x32xf32>,
-    ln1_g: Tensor<32xf32>,
-    ln1_b: Tensor<32xf32>,
-    ln2_g: Tensor<32xf32>,
-    ln2_b: Tensor<32xf32>,
+struct Attention {
     wq0: Tensor<32x16xf32>,
     wk0: Tensor<32x16xf32>,
     wv0: Tensor<32x16xf32>,
@@ -58,60 +23,113 @@ fn block(
     wq1: Tensor<32x16xf32>,
     wk1: Tensor<32x16xf32>,
     wv1: Tensor<32x16xf32>,
-    wproj1: Tensor<16x32xf32>,
+    wproj1: Tensor<16x32xf32>
+}
+
+struct Block {
+    ln1_g: Tensor<32xf32>,
+    ln1_b: Tensor<32xf32>,
+    ln2_g: Tensor<32xf32>,
+    ln2_b: Tensor<32xf32>,
+    attn: Attention,
     fc1: Tensor<32x128xf32>,
     fc2: Tensor<128x32xf32>
-) -> Tensor<16x32xf32> {
-    let h = layernorm(x, ln1_g, ln1_b)
-    let a0 = attention(h, wq0, wk0, wv0)
-    let a1 = attention(h, wq1, wk1, wv1)
-    let merged = map(matmul(a0, wproj0), matmul(a1, wproj1)) |a, b| {
-        yield a + b
+}
+
+impl Attention {
+    // One head: the masked scores and the weighted values.
+    fn head(self, x: Tensor<16x32xf32>, wq: Tensor<32x16xf32>, wk: Tensor<32x16xf32>,
+            wv: Tensor<32x16xf32>) -> Tensor<16x16xf32> {
+        let q = matmul(x, wq)
+        let k = matmul(x, wk)
+        let v = matmul(x, wv)
+        let scaled = map(matmul(q, transpose(k))) |e| {
+            yield e * 0.25
+        }
+        let p = softmax_causal(self.causal(scaled), 16)
+        yield matmul(p, v)
     }
-    let x2 = map(x, merged) |a, b| {
-        yield a + b
+
+    // The causal mask: the scores of the future are set to a large negative
+    // number, so that the softmax ignores them.
+    fn causal(self, s: Tensor<16x16xf32>) -> Tensor<16x16xf32> {
+        yield for i in 0..16 step 1 iter(m = s) {
+            yield for j in 0..16 step 1 iter(m2 = m) {
+                if j > i {
+                    yield tensor.insert(m2, [i, j], -1000000.0)
+                } else {
+                    yield m2
+                }
+            }
+        }
     }
-    let h2 = layernorm(x2, ln2_g, ln2_b)
-    let g = map(matmul(h2, fc1)) |e| {
-        yield gelu(e)
+
+    fn forward(self, x: Tensor<16x32xf32>) -> Tensor<16x32xf32> {
+        let a0 = self.head(x, self.wq0, self.wk0, self.wv0)
+        let a1 = self.head(x, self.wq1, self.wk1, self.wv1)
+        yield map(matmul(a0, self.wproj0), matmul(a1, self.wproj1)) |a, b| {
+            yield a + b
+        }
     }
-    let f = matmul(g, fc2)
-    yield map(x2, f) |a, b| {
-        yield a + b
+}
+
+impl Block {
+    fn forward(self, x: Tensor<16x32xf32>) -> Tensor<16x32xf32> {
+        let h = layernorm(x, self.ln1_g, self.ln1_b)
+        let merged = self.attn.forward(h)
+        let x2 = map(x, merged) |a, b| {
+            yield a + b
+        }
+        let h2 = layernorm(x2, self.ln2_g, self.ln2_b)
+        let g = map(matmul(h2, self.fc1)) |e| {
+            yield gelu(e)
+        }
+        let f = matmul(g, self.fc2)
+        yield map(x2, f) |a, b| {
+            yield a + b
+        }
     }
 }
 
 fn main() {
     let wte = mlr.load<Tensor<66x32xf32>>("examples/gpt/wte.bin")
     let wpe = mlr.load<Tensor<16x32xf32>>("examples/gpt/wpe.bin")
-    let l0_ln1_g = mlr.load<Tensor<32xf32>>("examples/gpt/layer0_ln1_g.bin")
-    let l0_ln1_b = mlr.load<Tensor<32xf32>>("examples/gpt/layer0_ln1_b.bin")
-    let l0_ln2_g = mlr.load<Tensor<32xf32>>("examples/gpt/layer0_ln2_g.bin")
-    let l0_ln2_b = mlr.load<Tensor<32xf32>>("examples/gpt/layer0_ln2_b.bin")
-    let l0_wq0 = mlr.load<Tensor<32x16xf32>>("examples/gpt/layer0_wq0.bin")
-    let l0_wk0 = mlr.load<Tensor<32x16xf32>>("examples/gpt/layer0_wk0.bin")
-    let l0_wv0 = mlr.load<Tensor<32x16xf32>>("examples/gpt/layer0_wv0.bin")
-    let l0_wproj0 = mlr.load<Tensor<16x32xf32>>("examples/gpt/layer0_wproj0.bin")
-    let l0_wq1 = mlr.load<Tensor<32x16xf32>>("examples/gpt/layer0_wq1.bin")
-    let l0_wk1 = mlr.load<Tensor<32x16xf32>>("examples/gpt/layer0_wk1.bin")
-    let l0_wv1 = mlr.load<Tensor<32x16xf32>>("examples/gpt/layer0_wv1.bin")
-    let l0_wproj1 = mlr.load<Tensor<16x32xf32>>("examples/gpt/layer0_wproj1.bin")
-    let l0_fc1 = mlr.load<Tensor<32x128xf32>>("examples/gpt/layer0_fc1.bin")
-    let l0_fc2 = mlr.load<Tensor<128x32xf32>>("examples/gpt/layer0_fc2.bin")
-    let l1_ln1_g = mlr.load<Tensor<32xf32>>("examples/gpt/layer1_ln1_g.bin")
-    let l1_ln1_b = mlr.load<Tensor<32xf32>>("examples/gpt/layer1_ln1_b.bin")
-    let l1_ln2_g = mlr.load<Tensor<32xf32>>("examples/gpt/layer1_ln2_g.bin")
-    let l1_ln2_b = mlr.load<Tensor<32xf32>>("examples/gpt/layer1_ln2_b.bin")
-    let l1_wq0 = mlr.load<Tensor<32x16xf32>>("examples/gpt/layer1_wq0.bin")
-    let l1_wk0 = mlr.load<Tensor<32x16xf32>>("examples/gpt/layer1_wk0.bin")
-    let l1_wv0 = mlr.load<Tensor<32x16xf32>>("examples/gpt/layer1_wv0.bin")
-    let l1_wproj0 = mlr.load<Tensor<16x32xf32>>("examples/gpt/layer1_wproj0.bin")
-    let l1_wq1 = mlr.load<Tensor<32x16xf32>>("examples/gpt/layer1_wq1.bin")
-    let l1_wk1 = mlr.load<Tensor<32x16xf32>>("examples/gpt/layer1_wk1.bin")
-    let l1_wv1 = mlr.load<Tensor<32x16xf32>>("examples/gpt/layer1_wv1.bin")
-    let l1_wproj1 = mlr.load<Tensor<16x32xf32>>("examples/gpt/layer1_wproj1.bin")
-    let l1_fc1 = mlr.load<Tensor<32x128xf32>>("examples/gpt/layer1_fc1.bin")
-    let l1_fc2 = mlr.load<Tensor<128x32xf32>>("examples/gpt/layer1_fc2.bin")
+    let l0 = Block {
+        ln1_g: mlr.load<Tensor<32xf32>>("examples/gpt/layer0_ln1_g.bin"),
+        ln1_b: mlr.load<Tensor<32xf32>>("examples/gpt/layer0_ln1_b.bin"),
+        ln2_g: mlr.load<Tensor<32xf32>>("examples/gpt/layer0_ln2_g.bin"),
+        ln2_b: mlr.load<Tensor<32xf32>>("examples/gpt/layer0_ln2_b.bin"),
+        attn: Attention {
+            wq0: mlr.load<Tensor<32x16xf32>>("examples/gpt/layer0_wq0.bin"),
+            wk0: mlr.load<Tensor<32x16xf32>>("examples/gpt/layer0_wk0.bin"),
+            wv0: mlr.load<Tensor<32x16xf32>>("examples/gpt/layer0_wv0.bin"),
+            wproj0: mlr.load<Tensor<16x32xf32>>("examples/gpt/layer0_wproj0.bin"),
+            wq1: mlr.load<Tensor<32x16xf32>>("examples/gpt/layer0_wq1.bin"),
+            wk1: mlr.load<Tensor<32x16xf32>>("examples/gpt/layer0_wk1.bin"),
+            wv1: mlr.load<Tensor<32x16xf32>>("examples/gpt/layer0_wv1.bin"),
+            wproj1: mlr.load<Tensor<16x32xf32>>("examples/gpt/layer0_wproj1.bin")
+        },
+        fc1: mlr.load<Tensor<32x128xf32>>("examples/gpt/layer0_fc1.bin"),
+        fc2: mlr.load<Tensor<128x32xf32>>("examples/gpt/layer0_fc2.bin")
+    }
+    let l1 = Block {
+        ln1_g: mlr.load<Tensor<32xf32>>("examples/gpt/layer1_ln1_g.bin"),
+        ln1_b: mlr.load<Tensor<32xf32>>("examples/gpt/layer1_ln1_b.bin"),
+        ln2_g: mlr.load<Tensor<32xf32>>("examples/gpt/layer1_ln2_g.bin"),
+        ln2_b: mlr.load<Tensor<32xf32>>("examples/gpt/layer1_ln2_b.bin"),
+        attn: Attention {
+            wq0: mlr.load<Tensor<32x16xf32>>("examples/gpt/layer1_wq0.bin"),
+            wk0: mlr.load<Tensor<32x16xf32>>("examples/gpt/layer1_wk0.bin"),
+            wv0: mlr.load<Tensor<32x16xf32>>("examples/gpt/layer1_wv0.bin"),
+            wproj0: mlr.load<Tensor<16x32xf32>>("examples/gpt/layer1_wproj0.bin"),
+            wq1: mlr.load<Tensor<32x16xf32>>("examples/gpt/layer1_wq1.bin"),
+            wk1: mlr.load<Tensor<32x16xf32>>("examples/gpt/layer1_wk1.bin"),
+            wv1: mlr.load<Tensor<32x16xf32>>("examples/gpt/layer1_wv1.bin"),
+            wproj1: mlr.load<Tensor<16x32xf32>>("examples/gpt/layer1_wproj1.bin")
+        },
+        fc1: mlr.load<Tensor<32x128xf32>>("examples/gpt/layer1_fc1.bin"),
+        fc2: mlr.load<Tensor<128x32xf32>>("examples/gpt/layer1_fc2.bin")
+    }
     let ln_f_g = mlr.load<Tensor<32xf32>>("examples/gpt/ln_f_g.bin")
     let ln_f_b = mlr.load<Tensor<32xf32>>("examples/gpt/ln_f_b.bin")
     let lm_head = mlr.load<Tensor<32x66xf32>>("examples/gpt/lm_head.bin")
@@ -131,18 +149,8 @@ fn main() {
         let x = map(embed_seq(wte, tokens), wpe) |a, b| {
             yield a + b
         }
-        let x1 = block(
-            x, l0_ln1_g, l0_ln1_b, l0_ln2_g, l0_ln2_b,
-            l0_wq0, l0_wk0, l0_wv0, l0_wproj0,
-            l0_wq1, l0_wk1, l0_wv1, l0_wproj1,
-            l0_fc1, l0_fc2
-        )
-        let x2 = block(
-            x1, l1_ln1_g, l1_ln1_b, l1_ln2_g, l1_ln2_b,
-            l1_wq0, l1_wk0, l1_wv0, l1_wproj0,
-            l1_wq1, l1_wk1, l1_wv1, l1_wproj1,
-            l1_fc1, l1_fc2
-        )
+        let x1 = l0.forward(x)
+        let x2 = l1.forward(x1)
         let h = layernorm(x2, ln_f_g, ln_f_b)
         let logits = row(matmul(h, lm_head), 15)
         let next = sample(logits, 0.8, step + 12345)
