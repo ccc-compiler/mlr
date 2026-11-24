@@ -267,6 +267,19 @@ fn rejects_syntax_errors() {
     assert!(err.contains("error"), "{}", err);
 }
 
+#[test]
+fn rejects_a_non_string_tensor_name() {
+    let err = compile_err(
+        r#"
+fn main() {
+    let t = tensor.zeros<Tensor<6xf32>>()
+    mlr.save_pt("out.pt", t, 1)
+}
+"#,
+    );
+    assert!(err.contains("must be a string"), "{}", err);
+}
+
 // ---------------------------------------------------------------------------
 // End to end
 // ---------------------------------------------------------------------------
@@ -378,6 +391,23 @@ fn dot(a: Tensor<4x4xf32>, b: Tensor<4x4xf32>) -> f32 {
     );
     assert!(mlir.contains("func.call @mlr_matmul"), "{}", mlir);
     assert!(mlir.contains("func.func private @mlr_matmul"), "{}", mlir);
+    verify_mlir(&mlir);
+}
+
+#[test]
+fn saves_a_checkpoint_with_runtime_calls() {
+    let mlir = compile(
+        r#"
+fn main() {
+    let t = tensor.zeros<Tensor<6xf32>>()
+    mlr.save_pt("out.pt", t, "w")
+}
+"#,
+    );
+    assert!(mlir.contains("func.call @mlr_save_pt_begin"), "{}", mlir);
+    assert!(mlir.contains("func.call @mlr_save_pt_add"), "{}", mlir);
+    assert!(mlir.contains("func.call @mlr_save_pt_end"), "{}", mlir);
+    assert!(mlir.contains("memref.global"), "{}", mlir);
     verify_mlir(&mlir);
 }
 

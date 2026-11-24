@@ -1,0 +1,116 @@
+// A GRU that writes text, one byte at a time.
+//
+// The model was trained with `tools/train_torch_models.py` (PyTorch) on the
+// corpus of `examples/lm/input.txt` and the weights are embedded into the
+// program at compile time with `mlr.load`.
+//
+// The corpus is read as bytes, so the generated text is written byte by byte
+// with `print_byte`.
+//
+//   reset gate    r = sigmoid(W_ir x + b_ir + W_hr h + b_hr)
+//   update gate   z = sigmoid(W_iz x + b_iz + W_hz h + b_hz)
+//   new state     n = tanh(W_in x + b_in + r * (W_hn h + b_hn))
+//   hidden state  h' = (1 - z) * n + z * h
+
+fn gru_step(
+    x: Tensor<32xf32>,
+    h: Tensor<32xf32>,
+    w_r_ih: Tensor<32x32xf32>,
+    w_r_hh: Tensor<32x32xf32>,
+    b_r: Tensor<32xf32>,
+    w_z_ih: Tensor<32x32xf32>,
+    w_z_hh: Tensor<32x32xf32>,
+    b_z: Tensor<32xf32>,
+    w_n_ih: Tensor<32x32xf32>,
+    w_n_hh: Tensor<32x32xf32>,
+    b_n: Tensor<32xf32>
+) -> Tensor<32xf32> {
+    // The reset gate.
+    let r = map(
+        add_bias(matmul(w_r_ih, x), b_r),
+        add_bias(matmul(w_r_hh, h), b_r)
+    ) |a, b| {
+        yield sigmoid(a + b)
+    }
+    // The update gate.
+    let z = map(
+        add_bias(matmul(w_z_ih, x), b_z),
+        add_bias(matmul(w_z_hh, h), b_z)
+    ) |a, b| {
+        yield sigmoid(a + b)
+    }
+    // The new state.
+    let n = map(
+        add_bias(matmul(w_n_ih, x), b_n),
+        map(r, add_bias(matmul(w_n_hh, h), b_n)) |a, b| {
+            yield a * b
+        }
+    ) |a, b| {
+        yield tanh(a + b)
+    }
+    // The new hidden state: (1 - z) * n + z * h.
+    yield map(
+        map(z, n) |a, b| {
+            yield (1.0 - a) * b
+        },
+        map(z, h) |a, b| {
+            yield a * b
+        }
+    ) |a, b| {
+        yield a + b
+    }
+}
+
+fn main() {
+    let wte = mlr.load<Tensor<66x32xf32>>("examples/gru/wte.bin")
+    let w_r_ih = mlr.load<Tensor<32x32xf32>>("examples/gru/w_r_ih.bin")
+    let w_r_hh = mlr.load<Tensor<32x32xf32>>("examples/gru/w_r_hh.bin")
+    let b_r = mlr.load<Tensor<32xf32>>("examples/gru/b_r.bin")
+    let w_z_ih = mlr.load<Tensor<32x32xf32>>("examples/gru/w_z_ih.bin")
+    let w_z_hh = mlr.load<Tensor<32x32xf32>>("examples/gru/w_z_hh.bin")
+    let b_z = mlr.load<Tensor<32xf32>>("examples/gru/b_z.bin")
+    let w_n_ih = mlr.load<Tensor<32x32xf32>>("examples/gru/w_n_ih.bin")
+    let w_n_hh = mlr.load<Tensor<32x32xf32>>("examples/gru/w_n_hh.bin")
+    let b_n = mlr.load<Tensor<32xf32>>("examples/gru/b_n.bin")
+    let lm_head = mlr.load<Tensor<32x66xf32>>("examples/gru/lm_head.bin")
+    let prompt = mlr.load<Tensor<4xi32>>("examples/gru/prompt.bin")
+    // The table that maps a token index back to its byte.
+    let vocab = mlr.load<Tensor<66xi32>>("examples/gru/vocab.bin")
+
+    // The prompt is written first.
+    print_byte(tensor.extract(vocab, [tensor.extract(prompt, [0])]))
+    print_byte(tensor.extract(vocab, [tensor.extract(prompt, [1])]))
+    print_byte(tensor.extract(vocab, [tensor.extract(prompt, [2])]))
+    print_byte(tensor.extract(vocab, [tensor.extract(prompt, [3])]))
+
+    // The hidden state after the prompt has been read.
+    let h0 = tensor.zeros<Tensor<32xf32>>()
+    let h1 = for i in 0..4 step 1 iter(h = h0) {
+        let x = embed(wte, tensor.extract(prompt, [i]))
+        yield gru_step(
+            x, h,
+            w_r_ih, w_r_hh, b_r,
+            w_z_ih, w_z_hh, b_z,
+            w_n_ih, w_n_hh, b_n
+        )
+    }
+
+    // The loop writes twelve more bytes.
+    let text = for step in 0..12 step 1 iter(
+        h = h1,
+        token = tensor.extract(prompt, [3])
+    ) {
+        let x = embed(wte, token)
+        let h2 = gru_step(
+            x, h,
+            w_r_ih, w_r_hh, b_r,
+            w_z_ih, w_z_hh, b_z,
+            w_n_ih, w_n_hh, b_n
+        )
+        let logits = matmul(h2, lm_head)
+        let next = sample(logits, 0.8, step + 12345)
+        print_byte(tensor.extract(vocab, [next]))
+        yield h2, next
+    }
+    print_byte(10)
+}

@@ -124,6 +124,12 @@ pub enum DomainOp {
     Row,
     ArgMax,
     AddBias,
+    Embed,
+    EmbedSeq,
+    Transpose,
+    LayerNorm,
+    SoftmaxCausal,
+    Sample,
 }
 
 impl DomainOp {
@@ -137,6 +143,12 @@ impl DomainOp {
             DomainOp::Row => "row",
             DomainOp::ArgMax => "argmax",
             DomainOp::AddBias => "add_bias",
+            DomainOp::Embed => "embed",
+            DomainOp::EmbedSeq => "embed_seq",
+            DomainOp::Transpose => "transpose",
+            DomainOp::LayerNorm => "layernorm",
+            DomainOp::SoftmaxCausal => "softmax_causal",
+            DomainOp::Sample => "sample",
         }
     }
 }
@@ -190,6 +202,13 @@ pub enum TExpr {
         indices: Vec<TExpr>,
         ty: CType,
     },
+    /// Writes a value into a tensor; the tensor is changed in place.
+    Insert {
+        tensor: Box<TExpr>,
+        indices: Vec<TExpr>,
+        value: Box<TExpr>,
+        ty: CType,
+    },
     /// An explicit numeric conversion (`index` <-> integer).
     Cast {
         value: Box<TExpr>,
@@ -206,7 +225,15 @@ pub enum TExpr {
     /// A tensor that is embedded into the program at compile time.
     Load {
         path: String,
+        /// The name of the tensor in a checkpoint file.
+        key: Option<String>,
         ty: CType,
+    },
+    /// Tensors that are written into a PyTorch checkpoint at run time.
+    Save {
+        path: String,
+        tensors: Vec<TExpr>,
+        keys: Vec<String>,
     },
 }
 
@@ -225,9 +252,11 @@ impl TExpr {
             TExpr::Map { ty, .. } => ty.clone(),
             TExpr::Reduce { ty, .. } => ty.clone(),
             TExpr::Extract { ty, .. } => ty.clone(),
+            TExpr::Insert { ty, .. } => ty.clone(),
             TExpr::Cast { to, .. } => to.clone(),
             TExpr::Domain { ty, .. } => ty.clone(),
             TExpr::Load { ty, .. } => ty.clone(),
+            TExpr::Save { .. } => CType::Void,
         }
     }
 
@@ -523,7 +552,15 @@ impl Checker {
                                 span,
                             );
                         }
-                        Ok(TExpr::Unary(*op, Box::new(e), ty))
+                        // The negation of a constant is a constant, so that
+                        // `-1.5` can be written wherever a literal goes.
+                        match e {
+                            TExpr::ConstInt(v, _) => {
+                                Ok(TExpr::ConstInt(-v, CType::Scalar(ScalarKind::I32)))
+                            }
+                            TExpr::ConstFloat(v, t) => Ok(TExpr::ConstFloat(-v, t)),
+                            e => Ok(TExpr::Unary(*op, Box::new(e), ty)),
+                        }
                     }
                     UnOp::Not => {
                         if !ty.is_bool() {
@@ -930,6 +967,69 @@ impl Checker {
                     ty: elem,
                 })
             }
+            Expr::Insert {
+                tensor,
+                indices,
+                value,
+                span,
+            } => {
+                let t = self.check_expr(tensor)?;
+                let ty = t.ty();
+                let dims = match &ty {
+                    CType::Tensor { dims, .. } => dims.clone(),
+                    _ => {
+                        return err(
+                            format!("`tensor.insert` expects a tensor, found {}", ty.print()),
+                            span,
+                        )
+                    }
+                };
+                if dims.len() != indices.len() {
+                    return err(
+                        format!(
+                            "`tensor.insert` expects {} index/indices but got {}",
+                            dims.len(),
+                            indices.len()
+                        ),
+                        span,
+                    );
+                }
+                let mut tidx = Vec::new();
+                for i in indices {
+                    let ie = self.check_expr(i)?;
+                    let ie = self.as_index(ie, span)?;
+                    let ie = match ie.ty() {
+                        CType::Index => ie,
+                        t => TExpr::Cast {
+                            value: Box::new(ie),
+                            from: t,
+                            to: CType::Index,
+                        },
+                    };
+                    tidx.push(ie);
+                }
+                let elem = ty.elem().cloned().unwrap();
+                let v = self.check_expr(value)?;
+                let v = match coerce(&v, &elem) {
+                    Some(v) => v,
+                    None => {
+                        return err(
+                            format!(
+                                "`tensor.insert` expects a value of type {} but found {}",
+                                elem.print(),
+                                v.ty().print()
+                            ),
+                            span,
+                        )
+                    }
+                };
+                Ok(TExpr::Insert {
+                    tensor: Box::new(t),
+                    indices: tidx,
+                    value: Box::new(v),
+                    ty,
+                })
+            }
         }
     }
 
@@ -1121,6 +1221,12 @@ impl Checker {
             "row" => DomainOp::Row,
             "argmax" => DomainOp::ArgMax,
             "add_bias" => DomainOp::AddBias,
+            "embed" => DomainOp::Embed,
+            "embed_seq" => DomainOp::EmbedSeq,
+            "transpose" => DomainOp::Transpose,
+            "layernorm" => DomainOp::LayerNorm,
+            "softmax_causal" => DomainOp::SoftmaxCausal,
+            "sample" => DomainOp::Sample,
             _ => unreachable!(),
         };
         let mut targs = Vec::new();
@@ -1163,6 +1269,48 @@ impl Checker {
             let e = elem(t)?;
             Ok((d, e))
         };
+        // A tensor of integers, used for the indices of a table.
+        let tensor_int = |t: &CType| -> Result<(Vec<i64>, CType), Error> {
+            if !t.is_tensor() {
+                return err(
+                    format!("`{}` expects tensors, found {}", name, t.print()),
+                    span,
+                );
+            }
+            let d = dims(t)?;
+            match t.elem() {
+                Some(e) if *e == CType::Scalar(ScalarKind::I32) => {}
+                _ => {
+                    return err(
+                        format!("`{}` expects a tensor of i32, found {}", name, t.print()),
+                        span,
+                    )
+                }
+            }
+            Ok((d, CType::Scalar(ScalarKind::I32)))
+        };
+        // An integer argument; an index is converted to i32.
+        let integer_arg = |args: &mut Vec<TExpr>,
+                           index: usize,
+                           what: &str,
+                           span: &Span|
+         -> Result<TExpr, Error> {
+            let t = args[index].ty();
+            match t {
+                CType::Scalar(k) if k == ScalarKind::I32 => Ok(args[index].clone()),
+                CType::Scalar(k) if k.is_int() => Ok(TExpr::Cast {
+                    value: Box::new(args[index].clone()),
+                    from: t,
+                    to: CType::Scalar(ScalarKind::I32),
+                }),
+                CType::Index => Ok(TExpr::Cast {
+                    value: Box::new(args[index].clone()),
+                    from: t,
+                    to: CType::Scalar(ScalarKind::I32),
+                }),
+                _ => err(format!("{} must be an integer", what), span),
+            }
+        };
 
         let (ty, params) = match op {
             DomainOp::MatMul => {
@@ -1171,13 +1319,13 @@ impl Checker {
                 }
                 let (da, _) = tensor(&targs[0].ty())?;
                 let (db, _) = tensor(&targs[1].ty())?;
-                if db.len() != 2 {
-                    return err("`matmul` multiplies a vector or a matrix by a matrix", span);
-                }
                 if da.len() != 1 && da.len() != 2 {
                     return err("`matmul` operates on rank-1 or rank-2 tensors", span);
                 }
-                // A vector is a matrix with a single row.
+                if db.len() != 1 && db.len() != 2 {
+                    return err("`matmul` operates on rank-1 or rank-2 tensors", span);
+                }
+                // A vector is a matrix with a single row (or column).
                 let (m, k) = if da.len() == 1 {
                     (1, da[0])
                 } else {
@@ -1187,15 +1335,21 @@ impl Checker {
                     return err(
                         format!(
                             "`matmul` cannot multiply {}x{} by {}x{}",
-                            m, k, db[0], db[1]
+                            m,
+                            k,
+                            db[0],
+                            if db.len() == 2 { db[1] } else { 1 }
                         ),
                         span,
                     );
                 }
-                let dims = if da.len() == 1 {
-                    vec![CDim::Static(db[1])]
-                } else {
-                    vec![CDim::Static(m), CDim::Static(db[1])]
+                // A vector times a matrix, a matrix times a vector or two
+                // matrices.
+                let dims = match (da.len(), db.len()) {
+                    (1, 2) => vec![CDim::Static(db[1])],
+                    (2, 2) => vec![CDim::Static(m), CDim::Static(db[1])],
+                    (2, 1) => vec![CDim::Static(m)],
+                    _ => return err("`matmul` needs a vector or a matrix", span),
                 };
                 (
                     CType::Tensor {
@@ -1329,6 +1483,147 @@ impl Checker {
                 }
                 (CType::Scalar(ScalarKind::I32), vec![])
             }
+            DomainOp::Embed => {
+                // embed(w: Tensor<VxWxf32>, id: i32) -> Tensor<Wxf32>
+                if targs.len() != 2 {
+                    return err("`embed` takes a table and an index", span);
+                }
+                let (dw, _) = tensor(&targs[0].ty())?;
+                if dw.len() != 2 {
+                    return err("`embed` expects a table of rank 2", span);
+                }
+                let id = integer_arg(&mut targs, 1, "the index of `embed`", span)?;
+                targs[1] = id;
+                (
+                    CType::Tensor {
+                        dims: vec![CDim::Static(dw[1])],
+                        elem: Box::new(CType::Scalar(ScalarKind::F32)),
+                    },
+                    vec![],
+                )
+            }
+            DomainOp::EmbedSeq => {
+                // embed_seq(w: Tensor<VxWxf32>, ids: Tensor<Nxi32>) -> Tensor<NxWxf32>
+                if targs.len() != 2 {
+                    return err("`embed_seq` takes a table and a tensor of indices", span);
+                }
+                let (dw, _) = tensor(&targs[0].ty())?;
+                if dw.len() != 2 {
+                    return err("`embed_seq` expects a table of rank 2", span);
+                }
+                let (di, _) = tensor_int(&targs[1].ty())?;
+                if di.len() != 1 {
+                    return err("`embed_seq` expects a tensor of rank 1", span);
+                }
+                (
+                    CType::Tensor {
+                        dims: vec![CDim::Static(di[0]), CDim::Static(dw[1])],
+                        elem: Box::new(CType::Scalar(ScalarKind::F32)),
+                    },
+                    vec![],
+                )
+            }
+            DomainOp::Transpose => {
+                // transpose(x: Tensor<MxNxf32>) -> Tensor<NxMxf32>
+                if targs.len() != 1 {
+                    return err("`transpose` takes one matrix", span);
+                }
+                let (d, e) = tensor(&targs[0].ty())?;
+                if d.len() != 2 {
+                    return err("`transpose` expects a matrix", span);
+                }
+                (
+                    CType::Tensor {
+                        dims: vec![CDim::Static(d[1]), CDim::Static(d[0])],
+                        elem: Box::new(e),
+                    },
+                    vec![],
+                )
+            }
+            DomainOp::LayerNorm => {
+                // layernorm(x: Tensor<MxNxf32>, gamma: Tensor<Nxf32>, beta: Tensor<Nxf32>)
+                if targs.len() != 3 {
+                    return err("`layernorm` takes a matrix, a scale and a shift", span);
+                }
+                let (dx, e) = tensor(&targs[0].ty())?;
+                let (dg, _) = tensor(&targs[1].ty())?;
+                let (db, _) = tensor(&targs[2].ty())?;
+                if dx.len() != 2 {
+                    return err("`layernorm` expects a matrix", span);
+                }
+                if dg.len() != 1 || db.len() != 1 {
+                    return err("`layernorm` expects a scale and a shift of rank 1", span);
+                }
+                if dx[1] != dg[0] || dg[0] != db[0] {
+                    return err(
+                        format!(
+                            "`layernorm` cannot normalize {} columns with a scale of {} elements",
+                            dx[1], dg[0]
+                        ),
+                        span,
+                    );
+                }
+                (
+                    CType::Tensor {
+                        dims: dx.iter().map(|v| CDim::Static(*v)).collect(),
+                        elem: Box::new(e),
+                    },
+                    vec![],
+                )
+            }
+            DomainOp::SoftmaxCausal => {
+                // softmax_causal(scores: Tensor<TxTxf32>, length: i32)
+                if targs.len() != 2 {
+                    return err("`softmax_causal` takes a matrix and a length", span);
+                }
+                let (d, e) = tensor(&targs[0].ty())?;
+                if d.len() != 2 || d[0] != d[1] {
+                    return err("`softmax_causal` expects a square matrix", span);
+                }
+                let length = integer_arg(&mut targs, 1, "the length of `softmax_causal`", span)?;
+                targs[1] = length;
+                (
+                    CType::Tensor {
+                        dims: d.iter().map(|v| CDim::Static(*v)).collect(),
+                        elem: Box::new(e),
+                    },
+                    vec![],
+                )
+            }
+            DomainOp::Sample => {
+                // sample(logits: Tensor<Nxf32>, temperature: f32, seed: i32) -> i32
+                if targs.len() != 3 {
+                    return err("`sample` takes logits, a temperature and a seed", span);
+                }
+                let (d, _) = tensor(&targs[0].ty())?;
+                if d.len() != 1 {
+                    return err("`sample` expects a tensor of rank 1", span);
+                }
+                let temperature = match targs[1].ty() {
+                    CType::Scalar(k) if k.is_float() => {
+                        // The runtime works with single precision floats.
+                        if k == ScalarKind::F32 {
+                            targs[1].clone()
+                        } else {
+                            TExpr::Cast {
+                                value: Box::new(targs[1].clone()),
+                                from: CType::Scalar(k),
+                                to: CType::Scalar(ScalarKind::F32),
+                            }
+                        }
+                    }
+                    t => {
+                        return err(
+                            format!("the temperature must be a float, found {}", t.print()),
+                            span,
+                        )
+                    }
+                };
+                targs[1] = temperature;
+                let seed = integer_arg(&mut targs, 2, "the seed of `sample`", span)?;
+                targs[2] = seed;
+                (CType::Scalar(ScalarKind::I32), vec![])
+            }
             DomainOp::AddBias => {
                 if targs.len() != 2 {
                     return err("`add_bias` takes a matrix and a bias vector", span);
@@ -1382,21 +1677,93 @@ impl Checker {
                 if type_args.len() != 1 {
                     return err("`mlr.load` takes exactly one type argument", span);
                 }
-                if args.len() != 1 {
-                    return err("`mlr.load` takes exactly one argument", span);
+                if args.is_empty() || args.len() > 2 {
+                    return err(
+                        "`mlr.load` takes a file name and, for a checkpoint, the name of a tensor",
+                        span,
+                    );
                 }
                 let path = match &args[0] {
                     Expr::Str(text, _) => text.clone(),
                     _ => return err("`mlr.load` expects a file name", span),
                 };
+                // The name of the tensor in a checkpoint.
+                let key = match args.get(1) {
+                    None => None,
+                    Some(Expr::Str(text, _)) => Some(text.clone()),
+                    Some(_) => return err("the name of a tensor must be a string", span),
+                };
                 let ty = self.resolve(&type_args[0]);
                 if !ty.is_tensor() {
                     return err("`mlr.load` expects a tensor type", span);
                 }
-                return Ok(TExpr::Load { path, ty });
+                return Ok(TExpr::Load { path, key, ty });
+            }
+            "mlr.save_pt" => {
+                if args.len() < 3 || args.len() % 2 == 0 {
+                    return err(
+                        "`mlr.save_pt` takes the path of a file and pairs of a tensor and a name",
+                        span,
+                    );
+                }
+                let path = match &args[0] {
+                    Expr::Str(text, _) => text.clone(),
+                    _ => {
+                        return err(
+                            "`mlr.save_pt` expects the path of the file as a string",
+                            span,
+                        )
+                    }
+                };
+                let mut tensors = Vec::new();
+                let mut keys = Vec::new();
+                let mut i = 1;
+                while i < args.len() {
+                    let t = self.check_expr(&args[i])?;
+                    let ty = t.ty();
+                    let dims = match ty.dims() {
+                        Some(d) => d,
+                        None => {
+                            return err(
+                                format!("`mlr.save_pt` expects tensors, found {}", ty.print()),
+                                span,
+                            )
+                        }
+                    };
+                    for d in dims {
+                        if matches!(d, CDim::Dynamic) {
+                            return err(
+                                "`mlr.save_pt` needs statically shaped tensors",
+                                span,
+                            );
+                        }
+                    }
+                    match ty.elem() {
+                        Some(CType::Scalar(ScalarKind::F32))
+                        | Some(CType::Scalar(ScalarKind::I32)) => {}
+                        _ => {
+                            return err(
+                                format!(
+                                    "`mlr.save_pt` cannot write {}, only f32 and i32 tensors",
+                                    ty.print()
+                                ),
+                                span,
+                            )
+                        }
+                    }
+                    let key = match &args[i + 1] {
+                        Expr::Str(text, _) => text.clone(),
+                        _ => return err("the name of a tensor must be a string", span),
+                    };
+                    tensors.push(t);
+                    keys.push(key);
+                    i += 2;
+                }
+                return Ok(TExpr::Save { path, tensors, keys });
             }
             "matmul" | "conv2d" | "maxpool2d" | "relu" | "flatten" | "row" | "argmax"
-            | "add_bias" => {
+            | "add_bias" | "embed" | "embed_seq" | "transpose" | "layernorm"
+            | "softmax_causal" | "sample" => {
                 return self.check_domain(name, args, span);
             }
             "print" => {
@@ -1410,6 +1777,55 @@ impl Checker {
                 }
                 return Ok(TExpr::Call {
                     name: name.to_string(),
+                    type_args: vec![],
+                    args: vec![a],
+                    ret: CType::Void,
+                });
+            }
+            // The scalar functions of the runtime library.
+            "exp" | "ln" | "sqrt" | "tanh" | "sigmoid" | "gelu" => {
+                if args.len() != 1 {
+                    return err(format!("`{}` takes exactly one argument", name), span);
+                }
+                let a = self.check_expr(&args[0])?;
+                let t = a.ty();
+                if !t.is_float() {
+                    return err(
+                        format!("`{}` expects a float, found {}", name, t.print()),
+                        span,
+                    );
+                }
+                // The runtime works with single precision floats.
+                let a = if t == CType::Scalar(ScalarKind::F32) {
+                    a
+                } else {
+                    TExpr::Cast {
+                        value: Box::new(a),
+                        from: t,
+                        to: CType::Scalar(ScalarKind::F32),
+                    }
+                };
+                return Ok(TExpr::Call {
+                    name: format!("mlr_{}", name),
+                    type_args: vec![],
+                    args: vec![a],
+                    ret: CType::Scalar(ScalarKind::F32),
+                });
+            }
+            "print_byte" => {
+                if args.len() != 1 {
+                    return err("`print_byte` takes exactly one argument", span);
+                }
+                let a = self.check_expr(&args[0])?;
+                let t = a.ty();
+                if !t.is_int() {
+                    return err(
+                        format!("`print_byte` expects an integer, found {}", t.print()),
+                        span,
+                    );
+                }
+                return Ok(TExpr::Call {
+                    name: "mlr_print_byte".into(),
                     type_args: vec![],
                     args: vec![a],
                     ret: CType::Void,

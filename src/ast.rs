@@ -160,6 +160,14 @@ pub enum Expr {
         indices: Vec<Box<Expr>>,
         span: Span,
     },
+    /// `tensor.insert(tensor, [index], value)` writes into a tensor.
+    Insert {
+        tensor: Box<Expr>,
+        #[allow(clippy::vec_box)]
+        indices: Vec<Box<Expr>>,
+        value: Box<Expr>,
+        span: Span,
+    },
 }
 
 impl Expr {
@@ -178,6 +186,7 @@ impl Expr {
             | Expr::Map { span: s, .. }
             | Expr::Reduce { span: s, .. }
             | Expr::Extract { span: s, .. } => s.clone(),
+            | Expr::Insert { span: s, .. } => s.clone(),
         }
     }
 }

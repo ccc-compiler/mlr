@@ -12,8 +12,8 @@ mod ir;
 mod lexer;
 mod parser;
 mod passes;
+mod pt;
 
-use std::collections::HashMap;
 use std::process::ExitCode;
 
 fn usage() -> &'static str {
@@ -126,19 +126,7 @@ fn main() -> ExitCode {
         return ExitCode::SUCCESS;
     }
 
-    // Signatures of the user functions, used to type the calls.
-    let mut sigs: HashMap<String, build::FuncSig> = HashMap::new();
-    for f in &typed.funcs {
-        sigs.insert(
-            f.name.clone(),
-            build::FuncSig {
-                params: f.params.iter().map(|(_, t)| t.clone()).collect(),
-                ret: f.ret.clone(),
-            },
-        );
-    }
-
-    let mut b = build::IrBuilder::new(&sigs, &path);
+    let mut b = build::IrBuilder::new(&path);
     let mut module = b.build_program(&typed);
     if !b.errors.is_empty() {
         for e in &b.errors {

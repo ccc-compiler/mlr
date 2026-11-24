@@ -192,21 +192,22 @@ fn is_pure(op: &Op) -> bool {
 }
 
 fn eliminate_dead_code(ops: &mut Vec<Op>) {
-    let mut used = std::collections::HashSet::new();
-    for op in ops.iter() {
-        for o in &op.operands {
-            used.insert(o.id);
-        }
-        for region in &op.regions {
-            for block in &region.blocks {
-                for op in &block.ops {
-                    for o in &op.operands {
-                        used.insert(o.id);
-                    }
+    // The operands of an operation include the ones of the operations of its
+    // regions, at any depth.
+    fn mark_used(ops: &[Op], used: &mut std::collections::HashSet<usize>) {
+        for op in ops {
+            for o in &op.operands {
+                used.insert(o.id);
+            }
+            for region in &op.regions {
+                for block in &region.blocks {
+                    mark_used(&block.ops, used);
                 }
             }
         }
     }
+    let mut used = std::collections::HashSet::new();
+    mark_used(ops, &mut used);
     ops.retain(|op| {
         if !is_pure(op) {
             return true;

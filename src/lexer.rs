@@ -62,7 +62,7 @@ const PUNCTS: &[&str] = &[
 
 pub fn lex(src: &str) -> Result<Vec<Token>, Error> {
     let bytes = src.as_bytes();
-    let mut out = Vec::new();
+    let mut out: Vec<Token> = Vec::new();
     let mut i = 0usize;
     let mut line = 1u32;
     let mut col = 1u32;
@@ -115,8 +115,13 @@ pub fn lex(src: &str) -> Result<Vec<Token>, Error> {
             continue;
         }
         let span = Span { line, col };
-        if c == b'x' && i + 1 < bytes.len() && bytes[i + 1].is_ascii_digit() {
-            // The dimension separator of a tensor type: `64x128xf32`.
+        if c == b'x'
+            && i + 1 < bytes.len()
+            && bytes[i + 1].is_ascii_digit()
+            && matches!(out.last(), Some(t) if matches!(t.tok, Tok::Int(_)))
+        {
+            // The dimension separator of a tensor type: `64x128xf32`. Only
+            // directly after a number, so that `x2` stays an identifier.
             bump!(1);
             out.push(Token {
                 tok: Tok::Punct("x"),
@@ -307,3 +312,4 @@ mod tests {
         assert!(lex("/* unterminated").is_err());
     }
 }
+

@@ -436,6 +436,7 @@ impl Parser {
                     "map" => return self.parse_map(),
                     "reduce" => return self.parse_reduce(),
                     "tensor.extract" => return self.parse_extract(),
+                    "tensor.insert" => return self.parse_insert(),
                     _ => {}
                 }
                 // Explicit type arguments: `tensor.empty<Tensor<4xf32>>()`.
@@ -689,6 +690,33 @@ impl Parser {
         Ok(Expr::Extract {
             tensor: Box::new(tensor),
             indices: indices.into_iter().map(Box::new).collect(),
+            span,
+        })
+    }
+
+    fn parse_insert(&mut self) -> PResult<Expr> {
+        let span = self.span();
+        self.expect_punct("(")?;
+        let tensor = self.parse_expr()?;
+        self.expect_punct(",")?;
+        self.expect_punct("[")?;
+        let mut indices = Vec::new();
+        if !self.at_punct("]") {
+            loop {
+                indices.push(self.parse_expr()?);
+                if !self.eat_punct(",") {
+                    break;
+                }
+            }
+        }
+        self.expect_punct("]")?;
+        self.expect_punct(",")?;
+        let value = self.parse_expr()?;
+        self.expect_punct(")")?;
+        Ok(Expr::Insert {
+            tensor: Box::new(tensor),
+            indices: indices.into_iter().map(Box::new).collect(),
+            value: Box::new(value),
             span,
         })
     }

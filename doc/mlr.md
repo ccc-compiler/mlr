@@ -155,6 +155,12 @@ Metal Performance Shaders implementation.
 | `flatten(x)`                | any tensor → `Tensor<Nxf32>`                    | a flat copy of the tensor       |
 | `row(t, i)`                 | `Tensor<MxNxf32>` → `Tensor<Nxf32>`             | the `i`-th row                   |
 | `argmax(x)`                 | `Tensor<Nxf32>` → `i32`                         | the index of the largest element |
+| `embed(t, id)`              | `Tensor<VxNxf32>`, `i32` → `Tensor<Nxf32>`      | a row of a table                 |
+| `embed_seq(t, ids)`         | `Tensor<VxNxf32>`, `Tensor<Mxi32>` → `Tensor<MxNxf32>` | the rows of a table       |
+| `transpose(x)`              | `Tensor<MxNxf32>` → `Tensor<NxMxf32>`           | the transpose of a matrix        |
+| `layernorm(x, g, b)`        | `Tensor<MxNxf32>`, `Tensor<Nxf32>`, `Tensor<Nxf32>` → `Tensor<MxNxf32>` | normalizes every row |
+| `softmax_causal(x, n)`      | `Tensor<MxNxf32>`, `i32` → `Tensor<MxNxf32>`    | the softmax of every row, columns beyond `n` masked out |
+| `sample(x, t, seed)`        | `Tensor<Nxf32>`, `f32`, `i32` → `i32`           | a token drawn from the softmax of the logits at temperature `t` |
 
 A vector counts as a matrix with a single row, and an image may be written
 with or without its (single) channel dimension.
@@ -163,16 +169,51 @@ with or without its (single) channel dimension.
 
 ```
 let weights = mlr.load<Tensor<4x1x5x5xf32>>("weights.bin")
+let w = mlr.load<Tensor<768x768xf32>>("model.pt", "wte.weight")
+let e = mlr.load<Tensor<50257x768xf32>>("hf://openai-community/gpt2/model.safetensors", "wte.weight")
 ```
 
-`mlr.load` reads a file of raw little endian `f32` (or `i32`) values and
-embeds it into the program at compile time. The file must contain exactly as
-many elements as the type has. The data becomes a global constant buffer
-(`memref.global`), so the program needs no runtime file access.
+`mlr.load` reads a tensor and embeds it into the program at compile time. Three
+kinds of files are understood:
+
+* **A raw file** (`weights.bin`) of little endian `f32` (or `i32`) values. The
+  file must contain exactly as many elements as the type has.
+* **A PyTorch checkpoint** (`.pt`). The second argument names the tensor in the
+  checkpoint; it may be omitted when the checkpoint holds a single tensor.
+* **A `safetensors` file** (`.safetensors`), with the name of the tensor as the
+  second argument.
+
+A path that starts with `hf://<repo>/<file>` downloads the file from the
+Hugging Face hub into `~/.cache/mlr/huggingface/` and then reads it, so
+
+```
+let w = mlr.load<Tensor<50257x768xf32>>("hf://openai-community/gpt2/model.safetensors", "wte.weight")
+```
+
+loads a tensor of the GPT-2 embedding matrix. The data becomes a global
+constant buffer (`memref.global`), so the program needs no file access when it
+runs.
+
+### Writing a checkpoint
+
+```
+mlr.save_pt("out.pt", w, "w", b, "b")
+```
+
+`mlr.save_pt` writes tensors into a PyTorch checkpoint at run time. Every pair
+of a tensor (`f32` or `i32`) and a name becomes an entry that
+`torch.load(path, weights_only=True)` returns as a dictionary. The tensors are
+collected until the statement ends and the `.pt` archive is then written.
 
 ### Builtins
 
-`print(x)` prints a scalar. It is the only impure operation.
+`print(x)` prints a scalar, `print_byte(x)` writes one byte and `mlr.save_pt`
+writes a checkpoint; these are the only impure operations. The scalar
+functions are `exp`, `ln`, `sqrt`, `tanh`, `sigmoid` and `gelu`.
+
+The examples end with `examples/gpt/gpt.mlr`, a causal transformer (two
+layers, two heads, gelu, layer normalization) that generates text byte by
+byte; its weights were trained with `tools/train_torch_models.py`.
 
 ## Lowering
 
@@ -186,6 +227,7 @@ many elements as the type has. The data becomes a global constant buffer
 | 4     | `linalg.generic`          | nested `scf.for` loops over `memref`s            |
 | 4     | a constant tensor         | `memref.global` + `memref.get_global`            |
 | 5     | `mlr.matmul` and friends  | `func.call @mlr_matmul` and friends             |
+| 5     | `mlr.save_pt`             | string globals + `func.call @mlr_save_pt_*`     |
 
 See [architecture.md](architecture.md) for the details of every stage.
 

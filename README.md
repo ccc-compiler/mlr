@@ -114,6 +114,20 @@ library has two implementations with the same interface:
 
 The program itself does not know which runtime it is linked against.
 
+## Real checkpoints
+
+`mlr.load` embeds a tensor into the program at compile time. Besides a raw
+`.bin` file it reads PyTorch checkpoints (`.pt`) and `safetensors` files, and a
+`hf://<repo>/<file>` path downloads the file from the Hugging Face hub first:
+
+```
+let w = mlr.load<Tensor<50257x768xf32>>("hf://openai-community/gpt2/model.safetensors", "wte.weight")
+```
+
+At run time `mlr.save_pt("out.pt", w, "w")` writes tensors back into a
+checkpoint that `torch.load(path, weights_only=True)` reads as a dictionary.
+See [doc/mlr.md](doc/mlr.md) for the details.
+
 ## Documentation
 
 * [doc/mlr.md](doc/mlr.md) — the language specification

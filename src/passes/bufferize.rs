@@ -27,6 +27,7 @@ pub fn bufferize(module: &mut crate::ir::Module) {
             counts,
             globals: Vec::new(),
             global_index: 0,
+            consts: std::collections::HashSet::new(),
         };
         // Function signature: tensors become memrefs.
         for p in &mut f.params {
@@ -83,6 +84,9 @@ struct Bufferizer {
     counts: HashMap<usize, usize>,
     globals: Vec<crate::ir::Global>,
     global_index: usize,
+    /// The values that refer to a constant global buffer, which must be
+    /// copied before they are written.
+    consts: std::collections::HashSet<usize>,
 }
 
 impl Bufferizer {
@@ -131,6 +135,7 @@ impl Bufferizer {
                     o.attrs.push(("name".into(), Attr::Str(name)));
                     let res = self.fresh(ty);
                     o.results.push(res.clone());
+                    self.consts.insert(res.id);
                     self.map.insert(op.results[0].id, res);
                     out.push(o);
                 }
@@ -145,7 +150,21 @@ impl Bufferizer {
                 "tensor.insert" => {
                     // tensor.insert(value, tensor, indices...) -> memref.store
                     let value = op.operands[0].clone();
-                    let buf = self.buffer_of(&op.operands[1]);
+                    let mut buf = self.buffer_of(&op.operands[1]);
+                    if self.consts.contains(&buf.id) {
+                        // The buffer is a constant: it is copied, so that the
+                        // original values stay untouched.
+                        let ty = buf.ty.clone();
+                        let mut alloc = Op::new("memref.alloc");
+                        let copy = self.fresh(ty.clone());
+                        alloc.results.push(copy.clone());
+                        out.push(alloc);
+                        let mut cp = Op::new("memref.copy");
+                        cp.operands.push(buf.clone());
+                        cp.operands.push(copy.clone());
+                        out.push(cp);
+                        buf = copy;
+                    }
                     let indices: Vec<Value> = op.operands[2..].to_vec();
                     let mut o = Op::new("memref.store");
                     o.operands.push(value);
@@ -194,6 +213,18 @@ impl Bufferizer {
                             arg.ty = memref_of(&arg.ty);
                             self.map.insert(arg.id, arg.clone());
                         }
+                        // An argument that starts as a constant buffer stays
+                        // one until the first write copies it. The first
+                        // argument of the block is the induction variable, so
+                        // the iter args start at index one.
+                        let inits: Vec<Value> = o.operands[3..].to_vec();
+                        for (i, arg) in block.args.iter().skip(1).enumerate() {
+                            if let Some(init) = inits.get(i) {
+                                if self.consts.contains(&init.id) {
+                                    self.consts.insert(arg.id);
+                                }
+                            }
+                        }
                         let mut inner = Vec::new();
                         self.rewrite_block(&block.ops, &mut inner);
                         for op in &mut inner {
@@ -226,8 +257,7 @@ impl Bufferizer {
                     }
                     out.push(o);
                 }
-                "mlr.matmul" | "mlr.conv2d" | "mlr.maxpool2d" | "mlr.relu" | "mlr.flatten"
-                | "mlr.row" | "mlr.add_bias" => {
+                name if name.starts_with("mlr.") => {
                     let mut o = op.clone();
                     o.operands = op.operands.iter().map(|v| self.buffer_of(v)).collect();
                     for r in &mut o.results {
@@ -385,10 +415,6 @@ impl Bufferizer {
                     ops.push(op);
                 }
             }
-            // The loop carries the output buffer.
-            let mut term = Op::new("scf.yield");
-            term.operands.push(out_buf.clone());
-            ops.push(term);
             return ops;
         }
 
@@ -442,7 +468,7 @@ impl Bufferizer {
         for_op.operands.push(out_buf.clone());
         let res = self.fresh(out_ty.clone());
         for_op.results.push(res.clone());
-        let inner = self.build_loop_nest(
+        let mut inner = self.build_loop_nest(
             level + 1,
             dims,
             in_bufs,
@@ -452,6 +478,11 @@ impl Bufferizer {
             body,
             elem_ty,
         );
+        // Every loop region ends with a yield of its (in place updated)
+        // output buffer.
+        let mut term = Op::new("scf.yield");
+        term.operands.push(out_arg.clone());
+        inner.push(term);
         for_op.regions.push(Region {
             blocks: vec![crate::ir::Block {
                 args: vec![iv, out_arg],

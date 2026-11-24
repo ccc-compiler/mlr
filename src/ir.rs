@@ -276,6 +276,8 @@ pub enum Attr {
     StrList(Vec<String>),
     DenseF32(Vec<f32>),
     DenseI32(Vec<i32>),
+    /// A buffer of bytes, printed in the hexadecimal form of MLIR.
+    DenseI8(Vec<u8>),
 }
 
 impl Attr {
@@ -354,6 +356,13 @@ impl Attr {
                     }
                     out.push_str("\">");
                 }
+            }
+            Attr::DenseI8(values) => {
+                out.push_str("dense<\"0x");
+                for v in values {
+                    let _ = write!(out, "{:02X}", v);
+                }
+                out.push_str("\">");
             }
             Attr::StrList(items) => {
                 out.push('[');
@@ -890,7 +899,10 @@ impl Printer {
                 out.push_str("scf.if ");
                 self.value_list(out, &op.operands);
                 out.push_str(" -> (");
-                if let Some(r) = op.results.first() {
+                for (i, r) in op.results.iter().enumerate() {
+                    if i > 0 {
+                        out.push_str(", ");
+                    }
                     r.ty.print(out);
                 }
                 out.push(')');
@@ -944,7 +956,10 @@ impl Printer {
                     out.push(')');
                 }
                 out.push_str(" -> (");
-                if let Some(r) = op.results.first() {
+                for (i, r) in op.results.iter().enumerate() {
+                    if i > 0 {
+                        out.push_str(", ");
+                    }
                     r.ty.print(out);
                 }
                 out.push(')');
@@ -961,7 +976,10 @@ impl Printer {
                     out.push(' ');
                     self.value_list(out, &op.operands);
                     out.push_str(" : ");
-                    if let Some(o) = op.operands.first() {
+                    for (i, o) in op.operands.iter().enumerate() {
+                        if i > 0 {
+                            out.push_str(", ");
+                        }
                         o.ty.print(out);
                     }
                 }
@@ -1139,6 +1157,24 @@ impl Printer {
                 out.push_str("] : ");
                 if let Some(m) = op.operands.get(1) {
                     m.ty.print(out);
+                }
+            }
+            "memref.copy" => {
+                out.push_str("memref.copy ");
+                if let Some(s) = op.operands.first() {
+                    let _ = write!(out, "%{}", s.id);
+                }
+                out.push_str(", ");
+                if let Some(d) = op.operands.get(1) {
+                    let _ = write!(out, "%{}", d.id);
+                }
+                out.push_str(" : ");
+                if let Some(s) = op.operands.first() {
+                    s.ty.print(out);
+                }
+                out.push_str(" to ");
+                if let Some(d) = op.operands.get(1) {
+                    d.ty.print(out);
                 }
             }
             "memref.extract_aligned_pointer_as_index" => {

@@ -61,17 +61,67 @@ const RUNTIME: &[RuntimeFn] = &[
         result: None,
     },
     RuntimeFn {
+        name: "mlr_embed",
+        params: &["index", "i32", "index", "index", "index"],
+        result: None,
+    },
+    RuntimeFn {
+        name: "mlr_embed_seq",
+        params: &["index", "index", "index", "index", "index", "index"],
+        result: None,
+    },
+    RuntimeFn {
+        name: "mlr_transpose",
+        params: &["index", "index", "index", "index"],
+        result: None,
+    },
+    RuntimeFn {
+        name: "mlr_layernorm",
+        params: &["index", "index", "index", "index", "index", "index"],
+        result: None,
+    },
+    RuntimeFn {
+        name: "mlr_softmax_causal",
+        params: &["index", "i32", "index", "index"],
+        result: None,
+    },
+    RuntimeFn {
+        name: "mlr_sample",
+        params: &["index", "f32", "i32", "index"],
+        result: Some("i32"),
+    },
+    RuntimeFn {
         name: "mlr_argmax",
         params: &["index", "index"],
         result: Some("i32"),
+    },
+    RuntimeFn {
+        name: "mlr_save_pt_begin",
+        params: &["index"],
+        result: None,
+    },
+    RuntimeFn {
+        name: "mlr_save_pt_add",
+        params: &[
+            "index", "index", "index", "index", "index", "index", "index", "index", "index",
+        ],
+        result: None,
+    },
+    RuntimeFn {
+        name: "mlr_save_pt_end",
+        params: &[],
+        result: None,
     },
 ];
 
 pub fn lower_runtime_ops(module: &mut crate::ir::Module) {
     let mut used: Vec<&'static str> = Vec::new();
+    let mut globals: Vec<crate::ir::Global> = Vec::new();
+    let mut counter = 0usize;
     for f in &mut module.funcs {
-        lower_ops(&mut f.body.blocks[0].ops, &mut used);
+        lower_ops(&mut f.body.blocks[0].ops, &mut used, &mut globals, &mut counter);
     }
+    module.globals.extend(globals);
     // Every runtime function is declared once.
     let mut names: Vec<&'static str> = Vec::new();
     for name in used {
@@ -97,11 +147,16 @@ pub fn lower_runtime_ops(module: &mut crate::ir::Module) {
     }
 }
 
-fn lower_ops(ops: &mut Vec<Op>, used: &mut Vec<&'static str>) {
+fn lower_ops(
+    ops: &mut Vec<Op>,
+    used: &mut Vec<&'static str>,
+    globals: &mut Vec<crate::ir::Global>,
+    counter: &mut usize,
+) {
     for op in ops.iter_mut() {
         for region in &mut op.regions {
             for block in &mut region.blocks {
-                lower_ops(&mut block.ops, used);
+                lower_ops(&mut block.ops, used, globals, counter);
             }
         }
     }
@@ -115,7 +170,14 @@ fn lower_ops(ops: &mut Vec<Op>, used: &mut Vec<&'static str>) {
             "mlr.flatten" => lower_unary(op, used, &mut out, "mlr_flatten"),
             "mlr.row" => lower_row(op, used, &mut out),
             "mlr.add_bias" => lower_add_bias(op, used, &mut out),
+            "mlr.embed" => lower_embed(op, used, &mut out),
+            "mlr.embed_seq" => lower_embed_seq(op, used, &mut out),
+            "mlr.transpose" => lower_transpose(op, used, &mut out),
+            "mlr.layernorm" => lower_layernorm(op, used, &mut out),
+            "mlr.softmax_causal" => lower_softmax_causal(op, used, &mut out),
+            "mlr.sample" => lower_sample(op, used, &mut out),
             "mlr.argmax" => lower_argmax(op, used, &mut out),
+            "mlr.save_pt" => lower_save_pt(op, used, &mut out, globals, counter),
             _ => out.push(op),
         }
     }
@@ -179,6 +241,38 @@ impl Lowerer {
         op.results.push(res);
         op
     }
+
+    /// A NUL terminated string in a global buffer, returned as a pointer.
+    fn string_ptr(
+        &mut self,
+        globals: &mut Vec<crate::ir::Global>,
+        counter: &mut usize,
+        text: &str,
+        out: &mut Vec<Op>,
+    ) -> Value {
+        let mut bytes = text.as_bytes().to_vec();
+        bytes.push(0);
+        let name = format!("__mlr_str{}", *counter);
+        *counter += 1;
+        let ty = Type::MemRef {
+            shape: vec![Dim::Static(bytes.len() as i64)],
+            elem: Box::new(Type::Scalar(crate::ir::ScalarKind::I8)),
+        };
+        globals.push(crate::ir::Global {
+            name: name.clone(),
+            ty: ty.clone(),
+            value: Attr::DenseI8(bytes),
+        });
+        let mut get = Op::new("memref.get_global");
+        get.attrs.push(("name".into(), Attr::Str(name)));
+        let g = self.b.fresh_value(ty);
+        get.results.push(g.clone());
+        out.push(get);
+        let p = self.pointer(&g);
+        let r = p.results[0].clone();
+        out.push(p);
+        r
+    }
 }
 
 fn lower_matmul(op: Op, used: &mut Vec<&'static str>, out: &mut Vec<Op>) {
@@ -188,11 +282,12 @@ fn lower_matmul(op: Op, used: &mut Vec<&'static str>, out: &mut Vec<Op>) {
     let result = op.results[0].clone();
     let da = dims(&a.ty);
     let db = dims(&b.ty);
-    // A vector is a matrix with a single row.
-    let (m, k, n) = if da.len() == 1 {
-        (1, da[0], db[1])
-    } else {
-        (da[0], da[1], db[1])
+    // A vector is a matrix with a single row (or column).
+    let (m, k, n) = match (da.len(), db.len()) {
+        (1, 2) => (1, da[0], db[1]),
+        (2, 2) => (da[0], da[1], db[1]),
+        (2, 1) => (da[0], da[1], 1),
+        _ => (da[0], da[1], db[0]),
     };
     let mut l = Lowerer { b: Builder::new() };
     let out_ty = match &result.ty {
@@ -201,7 +296,11 @@ fn lower_matmul(op: Op, used: &mut Vec<&'static str>, out: &mut Vec<Op>) {
             elem: Box::new(Type::Scalar(crate::ir::ScalarKind::F32)),
         },
         _ => Type::MemRef {
-            shape: vec![Dim::Static(m), Dim::Static(n)],
+            shape: if da.len() == 2 && db.len() == 1 {
+                vec![Dim::Static(m)]
+            } else {
+                vec![Dim::Static(m), Dim::Static(n)]
+            },
             elem: Box::new(Type::Scalar(crate::ir::ScalarKind::F32)),
         },
     };
@@ -468,4 +567,320 @@ fn lower_argmax(op: Op, used: &mut Vec<&'static str>, out: &mut Vec<Op>) {
     call.operands = vec![px.results[0].clone(), cn.results[0].clone()];
     call.results.push(result);
     out.push(call);
+}
+
+/// The row of a table that belongs to an index.
+fn lower_embed(op: Op, used: &mut Vec<&'static str>, out: &mut Vec<Op>) {
+    used.push("mlr_embed");
+    let table = op.operands[0].clone();
+    let id = op.operands[1].clone();
+    let result = op.results[0].clone();
+    let dt = dims(&table.ty);
+    let (rows, width) = (dt[0], dt[1]);
+    let mut l = Lowerer { b: Builder::new() };
+    let out_ty = Type::MemRef {
+        shape: vec![Dim::Static(width)],
+        elem: Box::new(Type::Scalar(crate::ir::ScalarKind::F32)),
+    };
+    out.push(l.alloc(out_ty, &result));
+    let pt = l.pointer(&table);
+    let pout = l.pointer(&result);
+    let crows = l.const_index(rows);
+    let cwidth = l.const_index(width);
+    out.push(pt.clone());
+    out.push(pout.clone());
+    out.push(crows.clone());
+    out.push(cwidth.clone());
+    let mut call = Op::new("func.call");
+    call
+        .attrs
+        .push(("callee".into(), Attr::Str("mlr_embed".into())));
+    call.operands = vec![
+        pt.results[0].clone(),
+        id,
+        pout.results[0].clone(),
+        crows.results[0].clone(),
+        cwidth.results[0].clone(),
+    ];
+    out.push(call);
+}
+
+/// The rows of a table that belong to a tensor of indices.
+fn lower_embed_seq(op: Op, used: &mut Vec<&'static str>, out: &mut Vec<Op>) {
+    used.push("mlr_embed_seq");
+    let table = op.operands[0].clone();
+    let ids = op.operands[1].clone();
+    let result = op.results[0].clone();
+    let dt = dims(&table.ty);
+    let di = dims(&ids.ty);
+    let (rows, width, count) = (dt[0], dt[1], di[0]);
+    let mut l = Lowerer { b: Builder::new() };
+    let out_ty = Type::MemRef {
+        shape: vec![Dim::Static(count), Dim::Static(width)],
+        elem: Box::new(Type::Scalar(crate::ir::ScalarKind::F32)),
+    };
+    out.push(l.alloc(out_ty, &result));
+    let pt = l.pointer(&table);
+    let pi = l.pointer(&ids);
+    let pout = l.pointer(&result);
+    let crows = l.const_index(rows);
+    let cwidth = l.const_index(width);
+    let ccount = l.const_index(count);
+    out.push(pt.clone());
+    out.push(pi.clone());
+    out.push(pout.clone());
+    out.push(crows.clone());
+    out.push(cwidth.clone());
+    out.push(ccount.clone());
+    let mut call = Op::new("func.call");
+    call
+        .attrs
+        .push(("callee".into(), Attr::Str("mlr_embed_seq".into())));
+    call.operands = vec![
+        pt.results[0].clone(),
+        pi.results[0].clone(),
+        pout.results[0].clone(),
+        crows.results[0].clone(),
+        cwidth.results[0].clone(),
+        ccount.results[0].clone(),
+    ];
+    out.push(call);
+}
+
+/// Every row of a matrix is normalized.
+fn lower_layernorm(op: Op, used: &mut Vec<&'static str>, out: &mut Vec<Op>) {
+    used.push("mlr_layernorm");
+    let x = op.operands[0].clone();
+    let gamma = op.operands[1].clone();
+    let beta = op.operands[2].clone();
+    let result = op.results[0].clone();
+    let dx = dims(&x.ty);
+    let (rows, width) = (dx[0], dx[1]);
+    let mut l = Lowerer { b: Builder::new() };
+    let out_ty = match &result.ty {
+        Type::MemRef { shape, .. } => Type::MemRef {
+            shape: shape.clone(),
+            elem: Box::new(Type::Scalar(crate::ir::ScalarKind::F32)),
+        },
+        _ => Type::MemRef {
+            shape: vec![Dim::Static(rows), Dim::Static(width)],
+            elem: Box::new(Type::Scalar(crate::ir::ScalarKind::F32)),
+        },
+    };
+    out.push(l.alloc(out_ty, &result));
+    let px = l.pointer(&x);
+    let pg = l.pointer(&gamma);
+    let pb = l.pointer(&beta);
+    let pout = l.pointer(&result);
+    let crows = l.const_index(rows);
+    let cwidth = l.const_index(width);
+    out.push(px.clone());
+    out.push(pg.clone());
+    out.push(pb.clone());
+    out.push(pout.clone());
+    out.push(crows.clone());
+    out.push(cwidth.clone());
+    let mut call = Op::new("func.call");
+    call
+        .attrs
+        .push(("callee".into(), Attr::Str("mlr_layernorm".into())));
+    call.operands = vec![
+        px.results[0].clone(),
+        pg.results[0].clone(),
+        pb.results[0].clone(),
+        pout.results[0].clone(),
+        crows.results[0].clone(),
+        cwidth.results[0].clone(),
+    ];
+    out.push(call);
+}
+
+/// The softmax of the rows of a matrix, where the columns beyond the length
+/// are masked out.
+fn lower_softmax_causal(op: Op, used: &mut Vec<&'static str>, out: &mut Vec<Op>) {
+    used.push("mlr_softmax_causal");
+    let scores = op.operands[0].clone();
+    let length = op.operands[1].clone();
+    let result = op.results[0].clone();
+    let ds = dims(&scores.ty);
+    let size = ds[0];
+    let mut l = Lowerer { b: Builder::new() };
+    let out_ty = match &result.ty {
+        Type::MemRef { shape, .. } => Type::MemRef {
+            shape: shape.clone(),
+            elem: Box::new(Type::Scalar(crate::ir::ScalarKind::F32)),
+        },
+        _ => Type::MemRef {
+            shape: vec![Dim::Static(size), Dim::Static(size)],
+            elem: Box::new(Type::Scalar(crate::ir::ScalarKind::F32)),
+        },
+    };
+    out.push(l.alloc(out_ty, &result));
+    let ps = l.pointer(&scores);
+    let pout = l.pointer(&result);
+    let csize = l.const_index(size);
+    out.push(ps.clone());
+    out.push(pout.clone());
+    out.push(csize.clone());
+    let mut call = Op::new("func.call");
+    call
+        .attrs
+        .push(("callee".into(), Attr::Str("mlr_softmax_causal".into())));
+    call.operands = vec![
+        ps.results[0].clone(),
+        length,
+        pout.results[0].clone(),
+        csize.results[0].clone(),
+    ];
+    out.push(call);
+}
+
+/// A token is drawn from the distribution of the logits.
+fn lower_sample(op: Op, used: &mut Vec<&'static str>, out: &mut Vec<Op>) {
+    used.push("mlr_sample");
+    let logits = op.operands[0].clone();
+    let temperature = op.operands[1].clone();
+    let seed = op.operands[2].clone();
+    let result = op.results[0].clone();
+    let n = count(&logits.ty);
+    let mut l = Lowerer { b: Builder::new() };
+    let px = l.pointer(&logits);
+    let cn = l.const_index(n);
+    out.push(px.clone());
+    out.push(cn.clone());
+    let mut call = Op::new("func.call");
+    call
+        .attrs
+        .push(("callee".into(), Attr::Str("mlr_sample".into())));
+    call.operands = vec![
+        px.results[0].clone(),
+        temperature,
+        seed,
+        cn.results[0].clone(),
+    ];
+    call.results.push(result);
+    out.push(call);
+}
+
+/// The transpose of a matrix.
+fn lower_transpose(op: Op, used: &mut Vec<&'static str>, out: &mut Vec<Op>) {
+    used.push("mlr_transpose");
+    let x = op.operands[0].clone();
+    let result = op.results[0].clone();
+    let dx = dims(&x.ty);
+    let (rows, width) = (dx[0], dx[1]);
+    let mut l = Lowerer { b: Builder::new() };
+    let out_ty = Type::MemRef {
+        shape: vec![Dim::Static(width), Dim::Static(rows)],
+        elem: Box::new(Type::Scalar(crate::ir::ScalarKind::F32)),
+    };
+    out.push(l.alloc(out_ty, &result));
+    let px = l.pointer(&x);
+    let pout = l.pointer(&result);
+    let crows = l.const_index(rows);
+    let cwidth = l.const_index(width);
+    out.push(px.clone());
+    out.push(pout.clone());
+    out.push(crows.clone());
+    out.push(cwidth.clone());
+    let mut call = Op::new("func.call");
+    call
+        .attrs
+        .push(("callee".into(), Attr::Str("mlr_transpose".into())));
+    call.operands = vec![
+        px.results[0].clone(),
+        pout.results[0].clone(),
+        crows.results[0].clone(),
+        cwidth.results[0].clone(),
+    ];
+    out.push(call);
+}
+
+/// The element kind of a tensor, as the runtime names it.
+fn elem_kind(ty: &Type) -> i64 {
+    let elem = match ty {
+        Type::MemRef { elem, .. } | Type::Tensor { elem, .. } => &**elem,
+        _ => return 0,
+    };
+    match elem {
+        Type::Scalar(crate::ir::ScalarKind::I32) => 1,
+        Type::Scalar(crate::ir::ScalarKind::I64) => 2,
+        _ => 0,
+    }
+}
+
+/// Tensors are written into a PyTorch checkpoint. The runtime collects the
+/// tensors between `mlr_save_pt_begin` and `mlr_save_pt_end` and writes the
+/// archive when the checkpoint is closed.
+fn lower_save_pt(
+    op: Op,
+    used: &mut Vec<&'static str>,
+    out: &mut Vec<Op>,
+    globals: &mut Vec<crate::ir::Global>,
+    counter: &mut usize,
+) {
+    used.push("mlr_save_pt_begin");
+    used.push("mlr_save_pt_add");
+    used.push("mlr_save_pt_end");
+    let path = match op.attr("path") {
+        Some(Attr::Str(s)) => s.clone(),
+        _ => String::new(),
+    };
+    let keys = match op.attr("keys") {
+        Some(Attr::StrList(k)) => k.clone(),
+        _ => Vec::new(),
+    };
+    let mut l = Lowerer { b: Builder::new() };
+
+    let pp = l.string_ptr(globals, counter, &path, out);
+    let mut begin = Op::new("func.call");
+    begin
+        .attrs
+        .push(("callee".into(), Attr::Str("mlr_save_pt_begin".into())));
+    begin.operands = vec![pp];
+    out.push(begin);
+
+    for (tensor, key) in op.operands.iter().zip(keys.iter()) {
+        let kp = l.string_ptr(globals, counter, key, out);
+        let dp = l.pointer(tensor);
+        let n = count(&tensor.ty);
+        let ds = dims(&tensor.ty);
+        let ndim = ds.len() as i64;
+        let d = |i: usize| ds.get(i).copied().unwrap_or(1);
+        let ccount = l.const_index(n);
+        let cndim = l.const_index(ndim);
+        let c0 = l.const_index(d(0));
+        let c1 = l.const_index(d(1));
+        let c2 = l.const_index(d(2));
+        let c3 = l.const_index(d(3));
+        let ce = l.const_index(elem_kind(&tensor.ty));
+        out.push(dp.clone());
+        out.push(ccount.clone());
+        out.push(cndim.clone());
+        out.push(c0.clone());
+        out.push(c1.clone());
+        out.push(c2.clone());
+        out.push(c3.clone());
+        out.push(ce.clone());
+        let mut call = Op::new("func.call");
+        call.attrs
+            .push(("callee".into(), Attr::Str("mlr_save_pt_add".into())));
+        call.operands = vec![
+            kp,
+            dp.results[0].clone(),
+            ccount.results[0].clone(),
+            cndim.results[0].clone(),
+            c0.results[0].clone(),
+            c1.results[0].clone(),
+            c2.results[0].clone(),
+            c3.results[0].clone(),
+            ce.results[0].clone(),
+        ];
+        out.push(call);
+    }
+
+    let mut end = Op::new("func.call");
+    end.attrs
+        .push(("callee".into(), Attr::Str("mlr_save_pt_end".into())));
+    out.push(end);
 }

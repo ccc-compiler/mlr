@@ -31,16 +31,23 @@ pub fn ir_type(t: &CType) -> Type {
     }
 }
 
-#[derive(Clone)]
-pub struct FuncSig {
-    #[allow(dead_code)]
-    pub params: Vec<CType>,
-    pub ret: Option<CType>,
+/// The elements of a tensor that is embedded into the program.
+enum Elements {
+    Floats(Vec<f32>),
+    Ints(Vec<i32>),
 }
 
-pub struct IrBuilder<'a> {
+impl Elements {
+    fn len(&self) -> usize {
+        match self {
+            Elements::Floats(v) => v.len(),
+            Elements::Ints(v) => v.len(),
+        }
+    }
+}
+
+pub struct IrBuilder {
     b: Builder,
-    sigs: &'a HashMap<String, FuncSig>,
     file: String,
     scopes: Vec<HashMap<String, Value>>,
     /// The operation list of the region that is currently being built.
@@ -53,11 +60,10 @@ pub struct IrBuilder<'a> {
     pub errors: Vec<String>,
 }
 
-impl<'a> IrBuilder<'a> {
-    pub fn new(sigs: &'a HashMap<String, FuncSig>, file: &str) -> Self {
+impl IrBuilder {
+    pub fn new(file: &str) -> Self {
         IrBuilder {
             b: Builder::new(),
-            sigs,
             file: file.to_string(),
             scopes: Vec::new(),
             stack: Vec::new(),
@@ -110,6 +116,10 @@ impl<'a> IrBuilder<'a> {
                 "mlr_print_i64" => ("i64", vec![]),
                 "mlr_print_f32" => ("f32", vec![]),
                 "mlr_print_f64" => ("f64", vec![]),
+                "mlr_print_byte" => ("i32", vec![]),
+                "mlr_exp" | "mlr_ln" | "mlr_sqrt" | "mlr_tanh" | "mlr_sigmoid" | "mlr_gelu" => {
+                    ("f32", vec![ir::Type::scalar("f32").unwrap()])
+                }
                 _ => ("i1", vec![]),
             };
             module.decls.push(ir::FuncDecl {
@@ -130,7 +140,13 @@ impl<'a> IrBuilder<'a> {
             self.define(name, v.clone());
             params.push(v);
         }
-        let results: Vec<Type> = f.ret.as_ref().map(|t| vec![self.ty(t)]).unwrap_or_default();
+        let mut results: Vec<Type> = f.ret.as_ref().map(|t| vec![self.ty(t)]).unwrap_or_default();
+        // The entry point of the program is `main` of the C runtime, so it
+        // returns an exit code of zero even when the program has none.
+        let returns_exit_code = f.name == "main" && results.is_empty();
+        if returns_exit_code {
+            results = vec![Type::scalar("i32").unwrap()];
+        }
         let impure = body_is_impure(&f.body);
         let (mut ops, yields) = self.build_block(&f.body, results.len());
         // The body of a function is terminated by `func.return`, not by the
@@ -144,8 +160,16 @@ impl<'a> IrBuilder<'a> {
         if results.len() == 1 {
             match yields.first() {
                 Some(v) => term.operands.push(v.clone()),
-                None => {
+                None if !returns_exit_code => {
                     let v = self.fresh(results[0].clone());
+                    term.operands.push(v);
+                }
+                None => {
+                    let mut zero = Op::new("arith.constant");
+                    zero.attrs.push(("value".into(), Attr::Int(0)));
+                    let v = self.fresh(results[0].clone());
+                    zero.results.push(v.clone());
+                    ops.push(zero);
                     term.operands.push(v);
                 }
             }
@@ -368,8 +392,8 @@ impl<'a> IrBuilder<'a> {
                 name,
                 type_args,
                 args,
-                ..
-            } => self.call(name, type_args, args),
+                ret,
+            } => self.call(name, type_args, args, ret),
             TExpr::If {
                 cond,
                 then_block,
@@ -420,7 +444,7 @@ impl<'a> IrBuilder<'a> {
                 self.emit(o);
                 res
             }
-            TExpr::Load { path, ty } => {
+            TExpr::Load { path, key, ty } => {
                 let ty = self.ty(ty);
                 let count = match &ty {
                     Type::Tensor { shape, .. } => shape.iter().fold(1i64, |acc, d| {
@@ -431,25 +455,18 @@ impl<'a> IrBuilder<'a> {
                     }),
                     _ => 0,
                 };
-                let elem = ty
-                    .elem_type()
-                    .unwrap_or(Type::Scalar(crate::ir::ScalarKind::F32));
-                let bytes = match std::fs::read(path) {
-                    Ok(b) => b,
+                let mut o = Op::new("arith.constant");
+                let elements = match self.load_elements(path, key, &ty) {
+                    Ok(v) => v,
                     Err(e) => {
-                        self.errors.push(format!("cannot read `{}`: {}", path, e));
-                        let res = self.fresh(ty);
-                        return res;
+                        self.errors.push(e);
+                        Elements::Floats(Vec::new())
                     }
                 };
-                let mut o = Op::new("arith.constant");
-                match &elem {
-                    Type::Scalar(crate::ir::ScalarKind::I32) => {
-                        let mut values = Vec::with_capacity(bytes.len() / 4);
-                        for chunk in bytes.as_chunks::<4>().0 {
-                            values.push(i32::from_le_bytes(*chunk));
-                        }
-                        if values.len() as i64 != count {
+                let wrong_size = elements.len() as i64 != count;
+                match elements {
+                    Elements::Ints(values) => {
+                        if wrong_size && self.errors.is_empty() {
                             self.errors.push(format!(
                                 "`{}` contains {} elements but {} were expected",
                                 path,
@@ -459,12 +476,8 @@ impl<'a> IrBuilder<'a> {
                         }
                         o.attrs.push(("value".into(), Attr::DenseI32(values)));
                     }
-                    _ => {
-                        let mut values = Vec::with_capacity(bytes.len() / 4);
-                        for chunk in bytes.as_chunks::<4>().0 {
-                            values.push(f32::from_le_bytes(*chunk));
-                        }
-                        if values.len() as i64 != count {
+                    Elements::Floats(values) => {
+                        if wrong_size && self.errors.is_empty() {
                             self.errors.push(format!(
                                 "`{}` contains {} elements but {} were expected",
                                 path,
@@ -479,6 +492,21 @@ impl<'a> IrBuilder<'a> {
                 o.results.push(res.clone());
                 self.emit(o);
                 res
+            }
+            TExpr::Save {
+                path,
+                tensors,
+                keys,
+            } => {
+                let mut o = Op::new("mlr.save_pt");
+                o.generic = true;
+                for t in tensors {
+                    o.operands.push(self.expr(t));
+                }
+                o.attrs.push(("path".into(), Attr::Str(path.clone())));
+                o.attrs.push(("keys".into(), Attr::StrList(keys.clone())));
+                self.emit(o);
+                self.fresh(Type::Void)
             }
             TExpr::Cast { value, from, to } => {
                 let v = self.expr(value);
@@ -515,6 +543,23 @@ impl<'a> IrBuilder<'a> {
                     _ => simple("arith.sitofp", v, to),
                 }
             }
+            TExpr::Insert {
+                tensor,
+                indices,
+                value,
+                ty,
+            } => {
+                let mut o = Op::new("tensor.insert");
+                o.operands.push(self.expr(value));
+                o.operands.push(self.expr(tensor));
+                for i in indices {
+                    o.operands.push(self.expr(i));
+                }
+                let res = self.fresh(self.ty(ty));
+                o.results.push(res.clone());
+                self.emit(o);
+                res
+            }
             TExpr::Extract {
                 tensor,
                 indices,
@@ -536,7 +581,99 @@ impl<'a> IrBuilder<'a> {
         }
     }
 
-    fn call(&mut self, name: &str, type_args: &[CType], args: &[TExpr]) -> Value {
+    /// Reads the elements of a tensor that is embedded into the program.
+    ///
+    /// The file can be a raw file of little endian floats (`file.bin`), a
+    /// checkpoint of PyTorch (`file.pt`) or a safetensors file
+    /// (`file.safetensors`). A file whose name starts with `hf://` is
+    /// downloaded from HuggingFace.
+    fn load_elements(
+        &mut self,
+        path: &str,
+        key: &Option<String>,
+        ty: &Type,
+    ) -> Result<Elements, String> {
+        let shape: Vec<i64> = match ty {
+            Type::Tensor { shape, .. } => shape
+                .iter()
+                .map(|d| match d {
+                    Dim::Static(v) => *v,
+                    Dim::Dynamic => -1,
+                })
+                .collect(),
+            _ => Vec::new(),
+        };
+        let integer = matches!(
+            ty.elem_type(),
+            Some(Type::Scalar(crate::ir::ScalarKind::I32))
+        );
+        // A checkpoint of PyTorch or a safetensors file.
+        if path.ends_with(".pt") || path.ends_with(".safetensors") || path.starts_with("hf://") {
+            let file = match crate::pt::resolve(path) {
+                Ok(file) => file,
+                Err(e) => return Err(e),
+            };
+            let tensors = crate::pt::read_checkpoint(&file)?;
+            let name = match key {
+                Some(name) => name.clone(),
+                None => {
+                    // The only tensor of the file.
+                    if tensors.len() == 1 {
+                        tensors.keys().next().cloned().unwrap()
+                    } else {
+                        return Err(format!(
+                            "`{}` holds {} tensors, the name of the one to read is missing",
+                            path,
+                            tensors.len()
+                        ));
+                    }
+                }
+            };
+            let tensor = tensors.get(&name).ok_or_else(|| {
+                let mut names: Vec<&String> = tensors.keys().collect();
+                names.sort();
+                format!(
+                    "`{}` has no tensor `{}` (it holds {})",
+                    path,
+                    name,
+                    names
+                        .iter()
+                        .map(|n| n.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
+            })?;
+            if tensor.shape != shape {
+                return Err(format!(
+                    "the tensor `{}` of `{}` has the shape {:?} but {:?} was expected",
+                    name, path, tensor.shape, shape
+                ));
+            }
+            if integer {
+                Ok(Elements::Ints(tensor.as_i32()))
+            } else {
+                Ok(Elements::Floats(tensor.as_f32()))
+            }
+        } else {
+            // A raw file of little endian values.
+            let bytes = std::fs::read(path).map_err(|e| format!("cannot read `{}`: {}", path, e))?;
+            if integer {
+                let mut values = Vec::with_capacity(bytes.len() / 4);
+                for chunk in bytes.as_chunks::<4>().0 {
+                    values.push(i32::from_le_bytes(*chunk));
+                }
+                Ok(Elements::Ints(values))
+            } else {
+                let mut values = Vec::with_capacity(bytes.len() / 4);
+                for chunk in bytes.as_chunks::<4>().0 {
+                    values.push(f32::from_le_bytes(*chunk));
+                }
+                Ok(Elements::Floats(values))
+            }
+        }
+    }
+
+    fn call(&mut self, name: &str, type_args: &[CType], args: &[TExpr], ret: &CType) -> Value {
         match name {
             "print" => {
                 let v = self.expr(&args[0]);
@@ -559,6 +696,25 @@ impl<'a> IrBuilder<'a> {
                 self.emit(o);
                 return self.fresh(Type::Void);
             }
+            // The scalar functions of the runtime library.
+            "mlr_exp" | "mlr_ln" | "mlr_sqrt" | "mlr_tanh" | "mlr_sigmoid" | "mlr_gelu"
+            | "mlr_print_byte" => {
+                let v = self.expr(&args[0]);
+                if !self.runtime.contains(&name.to_string()) {
+                    self.runtime.push(name.to_string());
+                }
+                let mut o = Op::new("func.call");
+                o.attrs.push(("callee".into(), Attr::Str(name.to_string())));
+                o.operands.push(v);
+                if *ret == CType::Void {
+                    self.emit(o);
+                    return self.fresh(Type::Void);
+                }
+                let res = self.fresh(self.ty(ret));
+                o.results.push(res.clone());
+                self.emit(o);
+                return res;
+            }
             "tensor.empty" | "tensor.zeros" => {
                 let ty = self.ty(&type_args[0]);
                 let mut o = Op::new("tensor.empty");
@@ -572,13 +728,16 @@ impl<'a> IrBuilder<'a> {
             }
             _ => {}
         }
-        let sig = self.sigs.get(name).cloned();
         let mut o = Op::new("func.call");
         o.attrs.push(("callee".into(), Attr::Str(name.into())));
         for a in args {
             o.operands.push(self.expr(a));
         }
-        let ret = sig.and_then(|s| s.ret);
+        // The type checker knows the result type of every call.
+        let ret = match ret {
+            CType::Void => None,
+            t => Some(t.clone()),
+        };
         match ret {
             Some(t) => {
                 let res = self.fresh(self.ty(&t));
@@ -593,49 +752,74 @@ impl<'a> IrBuilder<'a> {
         }
     }
 
-    /// Fills a tensor with zeros using a structured loop.
+    /// Fills a tensor with zeros using nested structured loops.
     fn fill_zero(&mut self, tensor: Value, ty: Type) -> Value {
         let (shape, elem) = match &ty {
             Type::Tensor { shape, elem } => (shape.clone(), (**elem).clone()),
             _ => return tensor,
         };
         let mut zero = Op::new("arith.constant");
-        zero.attrs.push(("value".into(), Attr::Float(0.0)));
+        // The zero has the element type of the tensor.
+        match &elem {
+            Type::Scalar(k) if k.is_int() => zero.attrs.push(("value".into(), Attr::Int(0))),
+            _ => zero.attrs.push(("value".into(), Attr::Float(0.0))),
+        }
         let z = self.fresh(elem.clone());
         zero.results.push(z.clone());
         self.emit(zero);
 
-        let mut carried = tensor.clone();
-        for dim in shape.iter() {
-            let (lb, ub) = self.dim_bounds(dim);
-            let step = self.index_const(1);
-            let mut loop_op = Op::new("scf.for");
-            let iv = self.fresh(Type::Index);
-            let arg = self.fresh(ty.clone());
-            loop_op.operands.push(lb);
-            loop_op.operands.push(ub);
-            loop_op.operands.push(step);
-            loop_op.operands.push(carried.clone());
+        let mut indices = Vec::new();
+        self.fill_zero_rec(&shape, 0, &mut indices, &tensor, &z, &ty)
+    }
+
+    /// One level of the zero filling: a loop per dimension, and an insert of
+    /// the zero at the full index in the innermost one.
+    fn fill_zero_rec(
+        &mut self,
+        shape: &[Dim],
+        level: usize,
+        indices: &mut Vec<Value>,
+        carried: &Value,
+        z: &Value,
+        ty: &Type,
+    ) -> Value {
+        if level == shape.len() {
             let mut insert = Op::new("tensor.insert");
             insert.operands.push(z.clone());
-            insert.operands.push(arg.clone());
-            insert.operands.push(iv.clone());
+            insert.operands.push(carried.clone());
+            insert.operands.extend(indices.iter().cloned());
             let inserted = self.fresh(ty.clone());
             insert.results.push(inserted.clone());
-            let mut yield_op = Op::new("scf.yield");
-            yield_op.operands.push(inserted);
-            loop_op.regions.push(Region {
-                blocks: vec![ir::Block {
-                    args: vec![iv, arg],
-                    ops: vec![insert, yield_op],
-                }],
-            });
-            let res = self.fresh(ty.clone());
-            loop_op.results.push(res.clone());
-            self.emit(loop_op);
-            carried = res;
+            self.emit(insert);
+            return inserted;
         }
-        carried
+        let (lb, ub) = self.dim_bounds(&shape[level]);
+        let step = self.index_const(1);
+        let iv = self.fresh(Type::Index);
+        let arg = self.fresh(ty.clone());
+        let mut loop_op = Op::new("scf.for");
+        loop_op.operands.push(lb);
+        loop_op.operands.push(ub);
+        loop_op.operands.push(step);
+        loop_op.operands.push(carried.clone());
+        indices.push(iv.clone());
+        self.stack.push(Vec::new());
+        let inner = self.fill_zero_rec(shape, level + 1, indices, &arg, z, ty);
+        let mut ops = self.stack.pop().unwrap();
+        let mut yield_op = Op::new("scf.yield");
+        yield_op.operands.push(inner);
+        ops.push(yield_op);
+        loop_op.regions.push(Region {
+            blocks: vec![ir::Block {
+                args: vec![iv, arg],
+                ops,
+            }],
+        });
+        indices.pop();
+        let res = self.fresh(ty.clone());
+        loop_op.results.push(res.clone());
+        self.emit(loop_op);
+        res
     }
 
     fn index_const(&mut self, v: i64) -> Value {
@@ -953,6 +1137,7 @@ fn body_is_impure(block: &TBlock) -> bool {
             TExpr::Extract {
                 tensor, indices, ..
             } => expr_impure(tensor) || indices.iter().any(expr_impure),
+            TExpr::Save { tensors, .. } => tensors.iter().any(expr_impure),
             _ => false,
         }
     }

@@ -77,6 +77,7 @@ The IR comes with
 | `tensor.extract`        | `tensor.extract`                          |
 | `matmul` and friends    | `mlr.matmul` (generic form)               |
 | `mlr.load<T>(path)`     | `arith.constant` with a dense attribute   |
+| `mlr.save_pt(...)`      | `mlr.save_pt` (generic form)              |
 
 Every operation inherits the source location of the statement it belongs to,
 so the generated MLIR can be mapped back to the source.
