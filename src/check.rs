@@ -121,6 +121,9 @@ impl CType {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DomainOp {
     MatMul,
+    CrossEntropy,
+    Softmax,
+    Sum,
     Conv2d,
     MaxPool2d,
     Relu,
@@ -140,6 +143,9 @@ impl DomainOp {
     pub fn name(self) -> &'static str {
         match self {
             DomainOp::MatMul => "matmul",
+            DomainOp::CrossEntropy => "cross_entropy",
+            DomainOp::Softmax => "softmax",
+            DomainOp::Sum => "sum",
             DomainOp::Conv2d => "conv2d",
             DomainOp::MaxPool2d => "maxpool2d",
             DomainOp::Relu => "relu",
@@ -311,6 +317,16 @@ pub enum TStmt {
     Let {
         name: String,
         ty: CType,
+        value: TExpr,
+        span: Span,
+    },
+    /// `let (a, b) = expr` unpacks the values of a bundle; `_` skips one.
+    LetMulti {
+        names: Vec<String>,
+        /// The types of the values, in the order of the names; kept for the
+        /// completeness of the typed tree.
+        #[allow(dead_code)]
+        types: Vec<CType>,
         value: TExpr,
         span: Span,
     },
@@ -643,6 +659,39 @@ impl Checker {
                         span: span.clone(),
                     });
                 }
+                Stmt::LetMulti(m) => {
+                    let v = self.check_expr(&m.value)?;
+                    let id = self.struct_of(&v.ty(), "the unpacked value", &m.span)?;
+                    let fields = self.structs[id].fields.clone();
+                    if fields.len() != m.names.len() {
+                        return err(
+                            format!(
+                                "the value unpacks into {} value(s), {} name(s) were given",
+                                fields.len(),
+                                m.names.len()
+                            ),
+                            &m.span,
+                        );
+                    }
+                    for (i, name) in m.names.iter().enumerate() {
+                        let ty = &fields[i].1;
+                        if name != "_" {
+                            if self.scopes.last().unwrap().contains_key(name) {
+                                return err(
+                                    format!("`{}` is already declared in this scope", name),
+                                    &m.span,
+                                );
+                            }
+                            self.scopes.last_mut().unwrap().insert(name.clone(), ty.clone());
+                        }
+                    }
+                    out.stmts.push(TStmt::LetMulti {
+                        names: m.names.clone(),
+                        types: fields.iter().map(|(_, t)| t.clone()).collect(),
+                        value: v,
+                        span: m.span.clone(),
+                    });
+                }
                 Stmt::Effect(e) => {
                     let v = self.check_expr(e)?;
                     out.stmts.push(TStmt::Effect(v, e.span()));
@@ -775,16 +824,19 @@ impl Checker {
                     Some(b) => Some(Box::new(self.check_block(b, None)?)),
                     None => None,
                 };
+                // A tail that yields nothing (a `print`) counts as no tail.
                 let then_ty = then_block
                     .tail
                     .as_ref()
                     .filter(|v| !v.is_empty())
-                    .map(|v| v[0].ty());
+                    .map(|v| v[0].ty())
+                    .filter(|t| !matches!(t, CType::Void));
                 let else_ty = else_block
                     .as_ref()
                     .and_then(|b| b.tail.as_ref())
                     .filter(|v| !v.is_empty())
-                    .map(|v| v[0].ty());
+                    .map(|v| v[0].ty())
+                    .filter(|t| !matches!(t, CType::Void));
                 let ty = match (&then_ty, &else_ty) {
                     (Some(a), Some(b)) => {
                         if a != b {
@@ -1479,6 +1531,11 @@ impl Checker {
                 ))
             }
             _ => {
+                // A tensor and a scalar (or two tensors of the same shape)
+                // combine element by element: `w - 0.01 * dw`.
+                if lt.is_tensor() || rt.is_tensor() {
+                    return self.broadcast(op, l, r, span);
+                }
                 let (l, r, common) = self.unify_numeric(l, r, span, op)?;
                 if op == BinOp::Rem && !matches!(common, CType::Scalar(k) if k.is_int()) {
                     return err("`%` requires integer operands", span);
@@ -1486,6 +1543,119 @@ impl Checker {
                 Ok(TExpr::Binary(op, Box::new(l), Box::new(r), common))
             }
         }
+    }
+
+    /// The element wise combination of a tensor with a scalar or with another
+    /// tensor of the same shape, written as `map` with a scalar body.
+    fn broadcast(
+        &mut self,
+        op: BinOp,
+        l: TExpr,
+        r: TExpr,
+        span: &Span,
+    ) -> Result<TExpr, Error> {
+        match op {
+            BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div => {}
+            _ => {
+                return err(
+                    format!("`{}` is not defined for tensors", op.name()),
+                    span,
+                )
+            }
+        }
+        let (tensor, scalar) = if l.ty().is_tensor() && r.ty().is_tensor() {
+            // Two tensors of the same shape.
+            let lt = l.ty();
+            let rt = r.ty();
+            if lt != rt {
+                return err(
+                    format!("cannot combine {} and {} element wise", lt.print(), rt.print()),
+                    span,
+                );
+            }
+            let elem = lt.elem().cloned().unwrap();
+            let name = "$a";
+            let body = TBlock {
+                stmts: vec![],
+                tail: Some(vec![TExpr::Binary(
+                    op,
+                    Box::new(TExpr::Var(name.into(), elem.clone())),
+                    Box::new(TExpr::Var("$b".into(), elem.clone())),
+                    elem.clone(),
+                )]),
+                span: span.clone(),
+            };
+            return Ok(TExpr::Map {
+                inputs: vec![l, r],
+                attrs: vec![],
+                params: vec![name.into(), "$b".into()],
+                body: Box::new(body),
+                ty: lt,
+            });
+        } else if l.ty().is_tensor() {
+            (l, r)
+        } else if r.ty().is_tensor() {
+            // The scalar comes first: `2 * x`. The operation keeps its
+            // order, so the body is `2 - $a` for a subtraction.
+            let ty = r.ty();
+            let elem = ty.elem().cloned().unwrap();
+            let scalar = coerce(&l, &elem).ok_or_else(|| Error {
+                msg: format!(
+                    "cannot combine {} with the element type {}",
+                    l.ty().print(),
+                    elem.print()
+                ),
+                span: span.clone(),
+            })?;
+            let name = "$a";
+            let body = TBlock {
+                stmts: vec![],
+                tail: Some(vec![TExpr::Binary(
+                    op,
+                    Box::new(scalar),
+                    Box::new(TExpr::Var(name.into(), elem.clone())),
+                    elem.clone(),
+                )]),
+                span: span.clone(),
+            };
+            return Ok(TExpr::Map {
+                inputs: vec![r],
+                attrs: vec![],
+                params: vec![name.into()],
+                body: Box::new(body),
+                ty,
+            });
+        } else {
+            unreachable!("broadcast without a tensor")
+        };
+        let ty = tensor.ty();
+        let elem = ty.elem().cloned().unwrap();
+        let scalar = coerce(&scalar, &elem).ok_or_else(|| Error {
+            msg: format!(
+                "cannot combine {} with the element type {}",
+                scalar.ty().print(),
+                elem.print()
+            ),
+            span: span.clone(),
+        })?;
+        let name = "$a";
+        let body = TBlock {
+            stmts: vec![],
+            tail: Some(vec![TExpr::Binary(
+                op,
+                Box::new(TExpr::Var(name.into(), elem.clone())),
+                Box::new(scalar),
+                elem.clone(),
+            )]),
+            span: span.clone(),
+        };
+        Ok(TExpr::Map {
+            inputs: vec![tensor],
+            attrs: vec![],
+            params: vec![name.into()],
+            body: Box::new(body),
+            ty,
+        })
     }
 
     fn unify_numeric(
@@ -1580,12 +1750,26 @@ impl Checker {
             "transpose" => DomainOp::Transpose,
             "layernorm" => DomainOp::LayerNorm,
             "softmax_causal" => DomainOp::SoftmaxCausal,
+            "cross_entropy" => DomainOp::CrossEntropy,
+            "softmax" => DomainOp::Softmax,
+            "sum" => DomainOp::Sum,
             "sample" => DomainOp::Sample,
             _ => unreachable!(),
         };
         let mut targs = Vec::new();
         for a in args {
             targs.push(self.check_expr(a)?);
+        }
+        if name == "cross_entropy" {
+            // The labels are integers, so the shared check does not fit; the
+            // method below checks both arguments.
+            let (ty, params) = self.check_cross_entropy(&targs, span)?;
+            return Ok(TExpr::Domain {
+                op: DomainOp::CrossEntropy,
+                args: targs,
+                params,
+                ty,
+            });
         }
         // The element type of every tensor argument.
         let elem = |t: &CType| -> Result<CType, Error> {
@@ -1667,6 +1851,26 @@ impl Checker {
         };
 
         let (ty, params) = match op {
+            // Checked by `check_cross_entropy`, which the dispatch calls
+            // before this match.
+            DomainOp::CrossEntropy => unreachable!(),
+            DomainOp::Sum => {
+                // sum(t: Tensor<...xf32>) -> f32
+                if targs.len() != 1 {
+                    return err("`sum` takes one tensor", span);
+                }
+                let (d, e) = tensor(&targs[0].ty())?;
+                if e != CType::Scalar(ScalarKind::F32) {
+                    return err(
+                        format!("`sum` expects a tensor of f32, found {}", e.print()),
+                        span,
+                    );
+                }
+                if d.is_empty() {
+                    return err("`sum` expects a tensor with at least one dimension", span);
+                }
+                (CType::Scalar(ScalarKind::F32), vec![])
+            }
             DomainOp::MatMul => {
                 if targs.len() != 2 {
                     return err("`matmul` takes two matrices", span);
@@ -1944,6 +2148,29 @@ impl Checker {
                     vec![],
                 )
             }
+            DomainOp::Softmax => {
+                // softmax(x: Tensor<MxNxf32>) -> Tensor<MxNxf32>
+                if targs.len() != 1 {
+                    return err("`softmax` takes a matrix", span);
+                }
+                let (d, e) = tensor(&targs[0].ty())?;
+                if d.len() != 2 {
+                    return err("`softmax` expects a matrix", span);
+                }
+                if e != CType::Scalar(ScalarKind::F32) {
+                    return err(
+                        format!("`softmax` expects a matrix of f32, found {}", e.print()),
+                        span,
+                    );
+                }
+                (
+                    CType::Tensor {
+                        dims: d.iter().map(|v| CDim::Static(*v)).collect(),
+                        elem: Box::new(CType::Scalar(ScalarKind::F32)),
+                    },
+                    vec![],
+                )
+            }
             DomainOp::Sample => {
                 // sample(logits: Tensor<Nxf32>, temperature: f32, seed: i32) -> i32
                 if targs.len() != 3 {
@@ -2018,6 +2245,96 @@ impl Checker {
         })
     }
 
+
+    /// `cross_entropy(logits, labels)`: the mean cross entropy of the rows;
+    /// the labels are integers, so the arguments are checked here and not by
+    /// the shared tensor rules.
+    fn check_cross_entropy(
+        &mut self,
+        targs: &[TExpr],
+        span: &Span,
+    ) -> Result<(CType, Vec<i64>), Error> {
+        if targs.len() != 2 {
+            return err("`cross_entropy` takes logits and labels", span);
+        }
+        let lt = targs[0].ty();
+        let (d, e) = match (lt.dims(), lt.elem()) {
+            (Some(dims), Some(elem)) => {
+                let mut dims_out = Vec::new();
+                for dim in dims {
+                    match dim {
+                        CDim::Static(v) => dims_out.push(*v),
+                        CDim::Dynamic => {
+                            return err(
+                                "`cross_entropy` needs statically shaped tensors",
+                                span,
+                            )
+                        }
+                    }
+                }
+                (dims_out, elem.clone())
+            }
+            _ => {
+                return err(
+                    format!("`cross_entropy` expects the logits as a matrix, found {}", lt.print()),
+                    span,
+                )
+            }
+        };
+        // A matrix of M rows, or a single sample (a vector of logits).
+        if d.len() != 2 && d.len() != 1 {
+            return err("`cross_entropy` expects the logits as a matrix", span);
+        }
+        if e != CType::Scalar(ScalarKind::F32) {
+            return err(
+                format!("`cross_entropy` expects logits of f32, found {}", e.print()),
+                span,
+            );
+        }
+        let yt = targs[1].ty();
+        let (dl, el) = match (yt.dims(), yt.elem()) {
+            (Some(dims), Some(elem)) => {
+                let mut dims_out = Vec::new();
+                for dim in dims {
+                    match dim {
+                        CDim::Static(v) => dims_out.push(*v),
+                        CDim::Dynamic => {
+                            return err(
+                                "`cross_entropy` needs statically shaped tensors",
+                                span,
+                            )
+                        }
+                    }
+                }
+                (dims_out, elem.clone())
+            }
+            _ => {
+                return err(
+                    format!("`cross_entropy` expects labels as a tensor, found {}", yt.print()),
+                    span,
+                )
+            }
+        };
+        if el != CType::Scalar(ScalarKind::I32) {
+            return err(
+                format!("`cross_entropy` expects labels of i32, found {}", el.print()),
+                span,
+            );
+        }
+        let rows = if d.len() == 1 { 1 } else { d[0] };
+        if dl.len() != 1 || dl[0] != rows {
+            return err(
+                format!(
+                    "the labels have {} element(s) but the logits have {} rows",
+                    dl.first().copied().unwrap_or(0),
+                    rows
+                ),
+                span,
+            );
+        }
+        Ok((CType::Scalar(ScalarKind::F32), vec![]))
+    }
+
     fn check_call(
         &mut self,
         name: &str,
@@ -2052,6 +2369,85 @@ impl Checker {
                     return err("`mlr.load` expects a tensor type", span);
                 }
                 return Ok(TExpr::Load { path, key, ty });
+            }
+            "value_and_grad" => {
+                // `value_and_grad(f, args...)`: the gradient of a function
+                // with respect to each of its tensor parameters.
+                if args.is_empty() {
+                    return err("`value_and_grad` takes a function and its arguments", span);
+                }
+                let fname = match &args[0] {
+                    Expr::Var(n, _) => n.clone(),
+                    _ => {
+                        return err(
+                            "`value_and_grad` expects the name of the function to differentiate",
+                            span,
+                        )
+                    }
+                };
+                let sig = match self.sigs.get(&fname) {
+                    Some(s) => s.clone(),
+                    None => return err(format!("unknown function `{}`", fname), span),
+                };
+                match &sig.ret {
+                    Some(CType::Scalar(ScalarKind::F32)) => {}
+                    t => {
+                        return err(
+                            format!(
+                                "`value_and_grad` needs a function that returns f32, `{}` returns {}",
+                                fname,
+                                t.clone().map(|t| t.print()).unwrap_or("()".into())
+                            ),
+                            span,
+                        )
+                    }
+                }
+                if sig.params.len() != args.len() - 1 {
+                    return err(
+                        format!(
+                            "`{}` takes {} argument(s), {} were given",
+                            fname,
+                            sig.params.len(),
+                            args.len() - 1
+                        ),
+                        span,
+                    );
+                }
+                let mut targs = Vec::new();
+                for (a, expected) in args[1..].iter().zip(sig.params.iter()) {
+                    let ta = self.check_expr(a)?;
+                    let ta = coerce(&ta, expected).ok_or_else(|| Error {
+                        msg: format!(
+                            "argument of `{}` has type {}, expected {}",
+                            fname,
+                            ta.ty().print(),
+                            expected.print()
+                        ),
+                        span: span.clone(),
+                    })?;
+                    targs.push(ta);
+                }
+                // The result is the loss and a slot per tensor parameter: the
+                // gradient of an f32 tensor, or zero for the others.
+                let mut fields = vec![(String::new(), CType::Scalar(ScalarKind::F32))];
+                for p in &sig.params {
+                    if p.is_tensor() {
+                        fields.push((String::new(), p.clone()));
+                    }
+                }
+                // An anonymous struct: the names of its fields are unused,
+                // the values are unpacked by position.
+                let id = self.structs.len();
+                self.structs.push(TStructDef {
+                    name: format!("@grad:{}", fname),
+                    fields,
+                });
+                return Ok(TExpr::Call {
+                    name: format!("@value_and_grad:{}", fname),
+                    type_args: vec![],
+                    args: targs,
+                    ret: CType::Struct(id),
+                });
             }
             "mlr.save_pt" => {
                 if args.len() < 3 || args.len() % 2 == 0 {
@@ -2117,7 +2513,7 @@ impl Checker {
             }
             "matmul" | "conv2d" | "maxpool2d" | "relu" | "flatten" | "row" | "argmax"
             | "add_bias" | "embed" | "embed_seq" | "transpose" | "layernorm"
-            | "softmax_causal" | "sample" => {
+            | "softmax_causal" | "sample" | "cross_entropy" | "softmax" | "sum" => {
                 return self.check_domain(name, args, span);
             }
             "print" => {

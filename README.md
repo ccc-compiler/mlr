@@ -114,6 +114,25 @@ library has two implementations with the same interface:
 
 The program itself does not know which runtime it is linked against.
 
+## Training inside MLR
+
+MLR trains too: `value_and_grad(loss, w, b, x, y)` differentiates a function
+with reverse mode automatic differentiation, and the training loop is a loop
+that carries the weights:
+
+```
+let trained = for step in 0..300 step 1 iter(state = start) {
+    let (l, dw, db, _, _) = value_and_grad(loss, state.w1, state.b1, x, y)
+    yield state with { w1: map(state.w1, dw) |a, g| { yield a - 0.5 * g } }
+}
+mlr.save_pt("trained.pt", trained.w1, "w1")
+```
+
+`scripts/run.sh examples/train/train_mlp.mlr` trains an MLP on a hundred
+MNIST images (the loss falls from 2.30 to 0.001 and every image is then
+classified correctly); the gradients agree with PyTorch to f32 precision
+(`tools/check_grad.py`).
+
 ## Real checkpoints
 
 `mlr.load` embeds a tensor into the program at compile time. Besides a raw
@@ -134,6 +153,7 @@ See [doc/mlr.md](doc/mlr.md) for the details.
 * [doc/architecture.md](doc/architecture.md) — the compiler and its lowering
   pipeline
 * [doc/struct.md](doc/struct.md) — the design of the struct types
+* [doc/train.md](doc/train.md) — the design of the training (backpropagation)
 
 ## Layout
 

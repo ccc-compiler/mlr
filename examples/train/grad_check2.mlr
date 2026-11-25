@@ -1,0 +1,46 @@
+// The gradients of the convolution, the max pooling, the flatten and the
+// embedding, printed for the comparison with the same model in PyTorch
+// (the second half of `tools/check_grad.py`).
+//
+// The numbers of the two programs must agree to f32 precision.
+
+// conv -> relu -> maxpool -> flatten -> matmul -> sum
+fn loss_conv(w1: Tensor<4x1x3x3xf32>, b1: Tensor<4xf32>, w2: Tensor<64x1xf32>, x: Tensor<8x8xf32>) -> f32 {
+    let c1 = relu(conv2d(x, w1, b1))
+    let p1 = maxpool2d(c1, 2)
+    let f1 = flatten(p1)
+    yield sum(matmul(f1, w2))
+}
+
+// embed_seq -> matmul -> add_bias -> cross_entropy
+fn loss_emb(wte: Tensor<10x8xf32>, head: Tensor<8x10xf32>, b: Tensor<10xf32>, ids: Tensor<3xi32>, y: Tensor<3xi32>) -> f32 {
+    let e = embed_seq(wte, ids)
+    let logits = add_bias(matmul(e, head), b)
+    yield cross_entropy(logits, y)
+}
+
+fn main() {
+    let w1 = mlr.load<Tensor<4x1x3x3xf32>>("examples/train/gccw1.bin")
+    let b1 = mlr.load<Tensor<4xf32>>("examples/train/gccb1.bin")
+    let w2 = mlr.load<Tensor<64x1xf32>>("examples/train/gccw2.bin")
+    let x = mlr.load<Tensor<8x8xf32>>("examples/train/gcx.bin")
+    let (l, dw1, db1, dw2, dx) = value_and_grad(loss_conv, w1, b1, w2, x)
+    print(l)
+    print(tensor.extract(dw1, [0, 0, 0, 0]))
+    print(tensor.extract(dw1, [3, 0, 2, 2]))
+    print(tensor.extract(db1, [2]))
+    print(tensor.extract(dw2, [63, 0]))
+    print(tensor.extract(dx, [7, 7]))
+    let wte = mlr.load<Tensor<10x8xf32>>("examples/train/gewte.bin")
+    let head = mlr.load<Tensor<8x10xf32>>("examples/train/gehead.bin")
+    let b = mlr.load<Tensor<10xf32>>("examples/train/geb.bin")
+    let ids = mlr.load<Tensor<3xi32>>("examples/train/geids.bin")
+    let ey = mlr.load<Tensor<3xi32>>("examples/train/gey.bin")
+    let (el, ewte, ehead, eb, _, _) = value_and_grad(loss_emb, wte, head, b, ids, ey)
+    print(el)
+    print(tensor.extract(ewte, [0, 0]))
+    print(tensor.extract(ewte, [5, 7]))
+    print(tensor.extract(ewte, [1, 0]))
+    print(tensor.extract(ehead, [0, 0]))
+    print(tensor.extract(eb, [9]))
+}

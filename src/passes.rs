@@ -416,5 +416,6 @@ fn substitute(op: &mut Op, subst: &HashMap<usize, Value>) {
     }
 }
 
+pub mod autodiff;
 pub mod bufferize;
 pub mod runtime_ops;

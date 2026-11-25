@@ -239,6 +239,8 @@ pub enum Stmt {
         value: Expr,
         span: Span,
     },
+    /// `let (a, b) = expr` unpacks several values at once.
+    LetMulti(LetMulti),
     /// An expression evaluated for its side effects.
     Effect(Expr),
 }
@@ -257,6 +259,14 @@ pub struct Block {
 pub struct Param {
     pub name: String,
     pub ty: SrcType,
+    pub span: Span,
+}
+
+/// `let (a, b) = expr` unpacks several values at once.
+#[derive(Clone, Debug)]
+pub struct LetMulti {
+    pub names: Vec<String>,
+    pub value: Expr,
     pub span: Span,
 }
 

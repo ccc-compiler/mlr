@@ -208,6 +208,9 @@ Metal Performance Shaders implementation.
 | `transpose(x)`              | `Tensor<MxNxf32>` → `Tensor<NxMxf32>`           | the transpose of a matrix        |
 | `layernorm(x, g, b)`        | `Tensor<MxNxf32>`, `Tensor<Nxf32>`, `Tensor<Nxf32>` → `Tensor<MxNxf32>` | normalizes every row |
 | `softmax_causal(x, n)`      | `Tensor<MxNxf32>`, `i32` → `Tensor<MxNxf32>`    | the softmax of every row, columns beyond `n` masked out |
+| `softmax(x)`                | `Tensor<MxNxf32>` → `Tensor<MxNxf32>`           | the softmax of every row |
+| `cross_entropy(logits, y)`  | `Tensor<MxVxf32>`, `Tensor<Mxi32>` → `f32`      | the mean cross entropy of the rows |
+| `sum(x)`                    | any tensor → `f32`                              | the sum of the elements |
 | `sample(x, t, seed)`        | `Tensor<Nxf32>`, `f32`, `i32` → `i32`           | a token drawn from the softmax of the logits at temperature `t` |
 
 A vector counts as a matrix with a single row, and an image may be written
@@ -262,6 +265,53 @@ functions are `exp`, `ln`, `sqrt`, `tanh`, `sigmoid` and `gelu`.
 The examples end with `examples/gpt/gpt.mlr`, a causal transformer (two
 layers, two heads, gelu, layer normalization) that generates text byte by
 byte; its weights were trained with `tools/train_torch_models.py`.
+
+## Training
+
+```
+fn loss(w: Tensor<3x4xf32>, b: Tensor<4xf32>, x: Tensor<2x3xf32>, y: Tensor<2xi32>) -> f32 {
+    let logits = add_bias(matmul(x, w), b)
+    yield cross_entropy(logits, y)
+}
+
+let (l, dw, db, _, _) = value_and_grad(loss, w, b, x, y)
+```
+
+`value_and_grad(f, args...)` differentiates `f` with reverse mode automatic
+differentiation: it returns the loss of `f` and one gradient per **tensor**
+parameter (a zero tensor for the ones that do not reach the loss, so the
+number of the values is fixed; integer tensors get no gradient). The
+compiler derives the backward pass from the IR of `f` — no tape, no runtime
+overhead beyond the gradient calls themselves.
+
+A training loop is a loop that carries the weights and yields new ones; a
+struct bundles them:
+
+```
+let trained = for step in 0..300 step 1 iter(state = start) {
+    let (l, dw, db, _, _) = value_and_grad(loss, state.w, state.b, x, y)
+    if step % 100 == 0 {
+        print(l)
+    }
+    yield state with {
+        w: map(state.w, dw) |a, g| { yield a - 0.1 * g },
+        b: map(state.b, db) |a, g| { yield a - 0.1 * g }
+    }
+}
+mlr.save_pt("trained.pt", trained.w, "w", trained.b, "b")
+```
+
+A tensor and a scalar (or two tensors of the same shape) combine element
+wise with `+ - * /`, which is what `w - 0.1 * dw` does. `let (a, b) = expr`
+unpacks several values at once; `_` skips one.
+
+The function that is differentiated must be a straight line program of
+operations with a known gradient (`matmul`, `add_bias`, `relu`, `gelu`,
+`cross_entropy`, `conv2d`, `maxpool2d`, `flatten`, `embed`, `embed_seq`,
+`sum`); a `for`, `if` or `map` inside it is a compile error. The examples
+train an MLP and a CNN (`examples/train`), and
+`tools/check_grad.py` compares the gradients with PyTorch. See
+[train.md](train.md) for the design and the next milestones.
 
 ## Lowering
 

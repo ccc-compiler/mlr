@@ -63,6 +63,9 @@ pub struct IrBuilder {
     pub errors: Vec<String>,
     /// The struct definitions of the program.
     structs: Vec<crate::check::TStructDef>,
+    /// The functions that `value_and_grad` differentiates; each one gets a
+    /// gradient version.
+    grad_funcs: Vec<String>,
     /// A struct value is a bundle of the values of its fields: this maps the
     /// id of the value that stands for the bundle to the values of its
     /// fields, flattened in the order of the definitions.
@@ -81,6 +84,7 @@ impl IrBuilder {
             errors: Vec::new(),
             structs: Vec::new(),
             struct_vals: HashMap::new(),
+            grad_funcs: Vec::new(),
         }
     }
 
@@ -188,6 +192,26 @@ impl IrBuilder {
         let mut module = ir::Module::default();
         for f in &prog.funcs {
             module.funcs.push(self.build_func(f));
+        }
+        // The gradient version of every function that `value_and_grad` uses.
+        for name in self.grad_funcs.clone() {
+            let f = match module.funcs.iter().find(|g| g.name == name) {
+                Some(f) => f.clone(),
+                None => {
+                    self.errors
+                        .push(format!("the function `{}` cannot be differentiated", name));
+                    continue;
+                }
+            };
+            if let Err(e) = crate::passes::autodiff::check_differentiable(&f) {
+                self.errors
+                    .push(format!("`{}` cannot be differentiated: {}", name, e));
+                continue;
+            }
+            // The runtime declarations of the gradient functions are added
+            // by the lowering of the domain operations (stage 5).
+            let (grad_fn, _used) = crate::passes::autodiff::value_and_grad_of(&f);
+            module.funcs.push(grad_fn);
         }
         for r in &self.runtime {
             let (arg, res) = match r.as_str() {
@@ -315,6 +339,16 @@ impl IrBuilder {
                     let v = self.expr(value);
                     let v = self.coerce_to(v, ty);
                     self.define(name, v);
+                }
+                TStmt::LetMulti { names, value, span, .. } => {
+                    self.cur_loc = Loc::new(&self.file, span.line, span.col);
+                    let v = self.expr(value);
+                    let leaves = self.leaves(&v);
+                    for (name, leaf) in names.iter().zip(leaves.iter()) {
+                        if name != "_" {
+                            self.define(name, leaf.clone());
+                        }
+                    }
                 }
                 TStmt::Effect(e, span) => {
                     self.cur_loc = Loc::new(&self.file, span.line, span.col);
@@ -822,6 +856,17 @@ impl IrBuilder {
     }
 
     fn call(&mut self, name: &str, type_args: &[CType], args: &[TExpr], ret: &CType) -> Value {
+        // A call of a gradient version of a function, which the program
+        // builder derives from the function itself.
+        let mut name = name.to_string();
+        if let Some(f) = name.strip_prefix("@value_and_grad:") {
+            let f = f.to_string();
+            if !self.grad_funcs.contains(&f) {
+                self.grad_funcs.push(f.clone());
+            }
+            name = format!("{}.value_and_grad", f);
+        }
+        let name = name.as_str();
         match name {
             "print" => {
                 let v = self.expr(&args[0]);
@@ -1324,6 +1369,7 @@ fn body_is_impure(block: &TBlock) -> bool {
     fn stmt_impure(s: &TStmt) -> bool {
         match s {
             TStmt::Let { value, .. } => expr_impure(value),
+            TStmt::LetMulti { value, .. } => expr_impure(value),
             TStmt::Effect(e, _) => expr_impure(e),
         }
     }

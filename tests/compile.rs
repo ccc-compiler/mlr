@@ -591,6 +591,94 @@ impl S {
 }
 
 #[test]
+fn differentiates_a_function() {
+    let mlir = compile(
+        r#"
+fn loss(w: Tensor<3x4xf32>, b: Tensor<4xf32>, x: Tensor<2x3xf32>, y: Tensor<2xi32>) -> f32 {
+    let logits = add_bias(matmul(x, w), b)
+    yield cross_entropy(logits, y)
+}
+
+fn main() {
+    let w = tensor.zeros<Tensor<3x4xf32>>()
+    let b = tensor.zeros<Tensor<4xf32>>()
+    let x = tensor.zeros<Tensor<2x3xf32>>()
+    let y = tensor.zeros<Tensor<2xi32>>()
+    let (l, dw, db, _, _) = value_and_grad(loss, w, b, x, y)
+    print(l)
+    print(tensor.extract(dw, [0, 0]))
+}
+"#,
+    );
+    assert!(mlir.contains("func.call @mlr_cross_entropy"), "{}", mlir);
+    assert!(mlir.contains("mlr_matmul_grad"), "{}", mlir);
+    assert!(mlir.contains("mlr_add_bias_grad"), "{}", mlir);
+    assert!(mlir.contains("mlr_cross_entropy_grad"), "{}", mlir);
+    // The zero gradient of the labels, lowered to a memset call.
+    assert!(mlir.contains("mlr_zero"), "{}", mlir);
+    verify_mlir(&mlir);
+}
+
+#[test]
+fn rejects_an_undifferentiable_function() {
+    let err = compile_err(
+        r#"
+fn loss(w: Tensor<3x4xf32>, x: Tensor<2x3xf32>, y: Tensor<2xi32>) -> f32 {
+    let logits = matmul(x, w)
+    let picked = map(logits) |v| {
+        yield v * v
+    }
+    yield tensor.extract(picked, [0, 0])
+}
+
+fn main() {
+    let w = tensor.zeros<Tensor<3x4xf32>>()
+    let x = tensor.zeros<Tensor<2x3xf32>>()
+    let y = tensor.zeros<Tensor<2xi32>>()
+    let (l, dw, _, _) = value_and_grad(loss, w, x, y)
+    print(l)
+}
+"#,
+    );
+    assert!(
+        err.contains("cannot be differentiated"),
+        "{}",
+        err
+    );
+}
+
+#[test]
+fn runs_the_training_of_the_cnn() {
+    let Some(out) = run_script("scripts/run.sh", "examples/train/train_cnn.mlr") else {
+        eprintln!("skipping: the LLVM tool chain is not available");
+        return;
+    };
+    let lines: Vec<&str> = out.lines().collect();
+    assert_eq!(lines.len(), 7, "{}", out);
+    let first: f32 = lines[0].parse().unwrap();
+    assert!((first - 2.27).abs() < 0.05, "{}", out);
+    // Every image is classified correctly after the training.
+    assert_eq!(lines[6], "100", "{}", out);
+}
+
+#[test]
+fn runs_the_training_of_the_mlp() {
+    let Some(out) = run_script("scripts/run.sh", "examples/train/train_mlp.mlr") else {
+        eprintln!("skipping: the LLVM tool chain is not available");
+        return;
+    };
+    let lines: Vec<&str> = out.lines().collect();
+    assert_eq!(lines.len(), 7, "{}", out);
+    // The loss starts at the cross entropy of a random model and falls.
+    let first: f32 = lines[0].parse().unwrap();
+    let last: f32 = lines[5].parse().unwrap();
+    assert!((first - 2.30).abs() < 0.01, "{}", out);
+    assert!(last < 0.05, "{}", out);
+    // Every image is classified correctly after the training.
+    assert_eq!(lines[6], "100", "{}", out);
+}
+
+#[test]
 fn runs_the_mnist_example_on_the_cpu() {
     let Some(out) = run_script("scripts/run.sh", "examples/mnist/mnist.mlr") else {
         eprintln!("skipping: the LLVM tool chain is not available");

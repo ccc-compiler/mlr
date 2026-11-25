@@ -1,0 +1,97 @@
+// Training a small CNN on MNIST inside MLR.
+//
+// The network is the one of `examples/mnist` (a 5x5 convolution, max pooling
+// and two dense layers); the weights start from small random values and full
+// batch gradient descent trains them with `value_and_grad`. The accuracy on
+// the hundred training images is counted at the end.
+//
+//   input   28x28x1
+//   conv1   4 filters, 5x5, padding 2  ->  4x28x28
+//   relu, maxpool 2x2                  ->  4x14x14
+//   flatten                            ->  784
+//   dense1  32 units, relu
+//   dense2  10 units
+
+struct Cnn {
+    cw1: Tensor<4x1x5x5xf32>,
+    cb1: Tensor<4xf32>,
+    cw2: Tensor<784x32xf32>,
+    cb2: Tensor<32xf32>,
+    cw3: Tensor<32x10xf32>,
+    cb3: Tensor<10xf32>
+}
+
+// The loss of the batch; the image enters without its channel dimension.
+fn loss(
+    cw1: Tensor<4x1x5x5xf32>,
+    cb1: Tensor<4xf32>,
+    cw2: Tensor<784x32xf32>,
+    cb2: Tensor<32xf32>,
+    cw3: Tensor<32x10xf32>,
+    cb3: Tensor<10xf32>,
+    x: Tensor<28x28xf32>,
+    y: Tensor<1xi32>
+) -> f32 {
+    let c1 = relu(conv2d(x, cw1, cb1))
+    let p1 = maxpool2d(c1, 2)
+    let f1 = flatten(p1)
+    let h = relu(add_bias(matmul(f1, cw2), cb2))
+    let logits = add_bias(matmul(h, cw3), cb3)
+    yield cross_entropy(logits, y)
+}
+
+// The digit of one image.
+fn predict(m: Cnn, img: Tensor<28x28xf32>) -> i32 {
+    let c1 = relu(conv2d(img, m.cw1, m.cb1))
+    let p1 = maxpool2d(c1, 2)
+    let f1 = flatten(p1)
+    let h = relu(add_bias(matmul(f1, m.cw2), m.cb2))
+    let logits = add_bias(matmul(h, m.cw3), m.cb3)
+    yield argmax(logits)
+}
+
+fn main() {
+    let images = mlr.load<Tensor<100x28x28xf32>>("examples/mnist/images.bin")
+    let labels = mlr.load<Tensor<100xi32>>("examples/mnist/labels.bin")
+    let start = Cnn {
+        cw1: mlr.load<Tensor<4x1x5x5xf32>>("examples/train/cw1.bin"),
+        cb1: mlr.load<Tensor<4xf32>>("examples/train/cb1.bin"),
+        cw2: mlr.load<Tensor<784x32xf32>>("examples/train/cw2.bin"),
+        cb2: mlr.load<Tensor<32xf32>>("examples/train/cb2.bin"),
+        cw3: mlr.load<Tensor<32x10xf32>>("examples/train/cw3.bin"),
+        cb3: mlr.load<Tensor<10xf32>>("examples/train/cb3.bin")
+    }
+
+    // One image per step, in order; the loss of the step is printed.
+    let trained = for step in 0..600 step 1 iter(state = start) {
+        let i = step % 100
+        let img = row(images, i)
+        let y = tensor.insert(tensor.zeros<Tensor<1xi32>>(), [0], tensor.extract(labels, [i]))
+        let (l, dw1, db1, dw2, db2, dw3, db3, _, _) = value_and_grad(
+            loss, state.cw1, state.cb1, state.cw2, state.cb2, state.cw3, state.cb3, img, y
+        )
+        if step % 100 == 0 {
+            print(l)
+        }
+        yield state with {
+            cw1: map(state.cw1, dw1) |a, g| { yield a - 0.05 * g },
+            cb1: map(state.cb1, db1) |a, g| { yield a - 0.05 * g },
+            cw2: map(state.cw2, dw2) |a, g| { yield a - 0.05 * g },
+            cb2: map(state.cb2, db2) |a, g| { yield a - 0.05 * g },
+            cw3: map(state.cw3, dw3) |a, g| { yield a - 0.05 * g },
+            cb3: map(state.cb3, db3) |a, g| { yield a - 0.05 * g }
+        }
+    }
+
+    // The accuracy of the trained network on the hundred images.
+    let correct = for i in 0..100 step 1 iter(acc = 0) {
+        let img = row(images, i)
+        let label = tensor.extract(labels, [i])
+        if predict(trained, img) == label {
+            yield acc + 1
+        } else {
+            yield acc
+        }
+    }
+    print(correct)
+}

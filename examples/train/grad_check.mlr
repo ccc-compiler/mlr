@@ -1,0 +1,42 @@
+// The gradients of the loss of one batch, printed for the comparison with
+// `tools/check_grad.py` (PyTorch).
+//
+// The numbers of the two programs must agree to f32 precision.
+
+fn loss(
+    w1: Tensor<784x128xf32>,
+    b1: Tensor<128xf32>,
+    w2: Tensor<128x64xf32>,
+    b2: Tensor<64xf32>,
+    w3: Tensor<64x10xf32>,
+    b3: Tensor<10xf32>,
+    x: Tensor<100x784xf32>,
+    y: Tensor<100xi32>
+) -> f32 {
+    let h1 = relu(add_bias(matmul(x, w1), b1))
+    let h2 = relu(add_bias(matmul(h1, w2), b2))
+    let logits = add_bias(matmul(h2, w3), b3)
+    yield cross_entropy(logits, y)
+}
+
+fn main() {
+    let w1 = mlr.load<Tensor<784x128xf32>>("examples/train/w1.bin")
+    let b1 = mlr.load<Tensor<128xf32>>("examples/train/b1.bin")
+    let w2 = mlr.load<Tensor<128x64xf32>>("examples/train/w2.bin")
+    let b2 = mlr.load<Tensor<64xf32>>("examples/train/b2.bin")
+    let w3 = mlr.load<Tensor<64x10xf32>>("examples/train/w3.bin")
+    let b3 = mlr.load<Tensor<10xf32>>("examples/train/b3.bin")
+    let x = mlr.load<Tensor<100x784xf32>>("examples/train/images.bin")
+    let y = mlr.load<Tensor<100xi32>>("examples/train/labels.bin")
+
+    let (l, dw1, db1, dw2, db2, dw3, db3, _, _) = value_and_grad(
+        loss, w1, b1, w2, b2, w3, b3, x, y
+    )
+    print(l)
+    print(tensor.extract(dw1, [0, 0]))
+    print(tensor.extract(dw1, [783, 127]))
+    print(tensor.extract(db1, [0]))
+    print(tensor.extract(dw2, [0, 0]))
+    print(tensor.extract(dw3, [0, 0]))
+    print(tensor.extract(db3, [9]))
+}

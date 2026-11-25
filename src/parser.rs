@@ -305,6 +305,31 @@ impl Parser {
             }
             if self.at_kw("let") {
                 let stmt_span = self.bump().span;
+                // `let (a, b) = expr` unpacks several values at once (the
+                // results of `value_and_grad`).
+                if self.at_punct("(") {
+                    self.bump();
+                    let mut names = Vec::new();
+                    if !self.at_punct(")") {
+                        loop {
+                            let (n, _) = self.expect_ident()?;
+                            names.push(n);
+                            if !self.eat_punct(",") {
+                                break;
+                            }
+                        }
+                    }
+                    self.expect_punct(")")?;
+                    self.expect_punct("=")?;
+                    let value = self.parse_expr()?;
+                    self.eat_punct(";");
+                    block.stmts.push(Stmt::LetMulti(LetMulti {
+                        names,
+                        value,
+                        span: stmt_span,
+                    }));
+                    continue;
+                }
                 let (name, _) = self.expect_ident()?;
                 let ty = if self.eat_punct(":") {
                     Some(self.parse_type()?)

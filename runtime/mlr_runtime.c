@@ -585,3 +585,306 @@ void mlr_save_pt_end(void) {
     free(out.data);
     mlr_ckpt_reset();
 }
+
+/* -------------------------------------------------------------------------
+ * Training: the loss and the gradients of the forward operations.
+ * ------------------------------------------------------------------------- */
+
+/* The mean cross entropy of the rows of the logits. */
+float mlr_cross_entropy(const void *logits, const void *labels, int64_t rows, int64_t vocab) {
+    const float *L = (const float *)logits;
+    const int32_t *Y = (const int32_t *)labels;
+    double total = 0.0;
+    for (int64_t r = 0; r < rows; r++) {
+        const float *row = L + r * vocab;
+        float best = row[0];
+        for (int64_t j = 1; j < vocab; j++) {
+            if (row[j] > best) best = row[j];
+        }
+        double sum = 0.0;
+        for (int64_t j = 0; j < vocab; j++) {
+            sum += expf(row[j] - best);
+        }
+        int32_t label = Y[r];
+        if (label < 0 || label >= vocab) {
+            fprintf(stderr, "mlr: the label %d is outside the vocabulary\n", label);
+            abort();
+        }
+        total -= log((double)expf(row[label] - best) / sum);
+    }
+    return (float)(total / (double)rows);
+}
+
+/* The gradient of the cross entropy: scale * (softmax - one hot) / rows. */
+void mlr_cross_entropy_grad(const void *logits, const void *labels, float scale, void *out,
+                            int64_t rows, int64_t vocab) {
+    const float *L = (const float *)logits;
+    const int32_t *Y = (const int32_t *)labels;
+    float *D = (float *)out;
+    scale = scale * (rows > 0 ? 1.0f / (float)rows : 0.0f);
+    for (int64_t r = 0; r < rows; r++) {
+        const float *row = L + r * vocab;
+        float *d = D + r * vocab;
+        float best = row[0];
+        for (int64_t j = 1; j < vocab; j++) {
+            if (row[j] > best) best = row[j];
+        }
+        double sum = 0.0;
+        for (int64_t j = 0; j < vocab; j++) {
+            sum += expf(row[j] - best);
+        }
+        for (int64_t j = 0; j < vocab; j++) {
+            float p = (float)(expf(row[j] - best) / sum);
+            d[j] = (p - (j == Y[r] ? 1.0f : 0.0f)) * scale;
+        }
+    }
+}
+
+/* The softmax of the rows of a matrix. */
+void mlr_softmax(const void *x, void *out, int64_t rows, int64_t cols) {
+    const float *X = (const float *)x;
+    float *Y = (float *)out;
+    for (int64_t r = 0; r < rows; r++) {
+        const float *row = X + r * cols;
+        float *dst = Y + r * cols;
+        float best = row[0];
+        for (int64_t j = 1; j < cols; j++) {
+            if (row[j] > best) best = row[j];
+        }
+        double sum = 0.0;
+        for (int64_t j = 0; j < cols; j++) {
+            float e = expf(row[j] - best);
+            dst[j] = e;
+            sum += e;
+        }
+        for (int64_t j = 0; j < cols; j++) {
+            dst[j] = (float)(dst[j] / sum);
+        }
+    }
+}
+
+/* A buffer filled with zeros. */
+void mlr_zero(void *p, int64_t n) {
+    memset(p, 0, (size_t)n * 4);
+}
+
+/* The element wise sum of two tensors. */
+void mlr_add_elem(const void *a, const void *b, void *out, int64_t n) {
+    const float *A = (const float *)a;
+    const float *B = (const float *)b;
+    float *O = (float *)out;
+    for (int64_t i = 0; i < n; i++) {
+        O[i] = A[i] + B[i];
+    }
+}
+
+/* The gradients of y = x @ w: dx = dy @ w^T, dw = x^T @ dy. */
+void mlr_matmul_grad(const void *x, const void *w, const void *dy, void *dx, void *dw, int64_t M,
+                     int64_t K, int64_t N) {
+    const float *X = (const float *)x;
+    const float *W = (const float *)w;
+    const float *DY = (const float *)dy;
+    float *DX = (float *)dx;
+    float *DW = (float *)dw;
+    /* dx (M x K) = dy (M x N) @ w^T (N x K). */
+    for (int64_t i = 0; i < M; i++) {
+        for (int64_t j = 0; j < K; j++) {
+            float sum = 0.0f;
+            for (int64_t k = 0; k < N; k++) {
+                sum += DY[i * N + k] * W[j * N + k];
+            }
+            DX[i * K + j] = sum;
+        }
+    }
+    /* dw (K x N) = x^T (K x M) @ dy (M x N). */
+    for (int64_t i = 0; i < K; i++) {
+        for (int64_t j = 0; j < N; j++) {
+            float sum = 0.0f;
+            for (int64_t k = 0; k < M; k++) {
+                sum += X[k * K + i] * DY[k * N + j];
+            }
+            DW[i * N + j] = sum;
+        }
+    }
+}
+
+/* The gradients of y = m + b: dm = dy, db = the sum of the rows of dy. */
+void mlr_add_bias_grad(const void *dy, void *dm, void *db, int64_t rows, int64_t cols) {
+    const float *DY = (const float *)dy;
+    float *DM = (float *)dm;
+    float *DB = (float *)db;
+    for (int64_t j = 0; j < cols; j++) {
+        DB[j] = 0.0f;
+    }
+    for (int64_t i = 0; i < rows; i++) {
+        for (int64_t j = 0; j < cols; j++) {
+            float v = DY[i * cols + j];
+            DM[i * cols + j] = v;
+            DB[j] += v;
+        }
+    }
+}
+
+/* The gradient of relu: dx = dy where x > 0. */
+void mlr_relu_grad(const void *x, const void *dy, void *dx, int64_t n) {
+    const float *X = (const float *)x;
+    const float *DY = (const float *)dy;
+    float *DX = (float *)dx;
+    for (int64_t i = 0; i < n; i++) {
+        DX[i] = X[i] > 0.0f ? DY[i] : 0.0f;
+    }
+}
+
+/* The gradient of gelu: dx = dy * (phi(x) + x * density(x)). */
+void mlr_gelu_grad(const void *x, const void *dy, void *dx, int64_t n) {
+    const float *X = (const float *)x;
+    const float *DY = (const float *)dy;
+    float *DX = (float *)dx;
+    for (int64_t i = 0; i < n; i++) {
+        float v = X[i];
+        float phi = 0.5f * (1.0f + erff(v * 0.70710678118f));
+        float density = expf(-0.5f * v * v) * 0.39894228040f;
+        DX[i] = DY[i] * (phi + v * density);
+    }
+}
+
+/* The sum of the elements of a tensor. */
+float mlr_sum(const void *x, int64_t n) {
+    const float *X = (const float *)x;
+    double total = 0.0;
+    for (int64_t i = 0; i < n; i++) {
+        total += X[i];
+    }
+    return (float)total;
+}
+
+/* The gradient of the sum: dx is the incoming gradient in every element. */
+void mlr_sum_grad(const void *x, float dy, void *dx, int64_t n) {
+    float *DX = (float *)dx;
+    for (int64_t i = 0; i < n; i++) {
+        DX[i] = dy;
+    }
+    (void)x;
+}
+
+/* A copy of a buffer (the gradient of the flatten, whose inverse is the
+ * reshape of the same layout). */
+void mlr_copy(const void *x, void *out, int64_t n) {
+    memcpy(out, x, (size_t)n * 4);
+}
+
+/* The gradients of the convolution y[o][y][x] = b[o] +
+ * sum(w[o][ky][kx] * x[y+ky-pad][x+kx-pad]).
+ *
+ * dx[iy][ix] = sum over (o, ky, kx, y, x) of dy[o][y][x] * w[o][ky][kx]
+ * dw[o][ky][kx] = sum over (y, x) of dy[o][y][x] * x[y+ky-pad][x+kx-pad]
+ * db[o] = sum over (y, x) of dy[o][y][x] */
+void mlr_conv2d_grad(const void *x, const void *w, const void *dy, void *dx, void *dw, void *db,
+                     int64_t O, int64_t H, int64_t W, int64_t K) {
+    const float *X = (const float *)x;
+    const float *Wt = (const float *)w;
+    const float *DY = (const float *)dy;
+    float *DX = (float *)dx;
+    float *DW = (float *)dw;
+    float *DB = (float *)db;
+    int64_t pad = K / 2;
+    for (int64_t i = 0; i < H * W; i++) {
+        DX[i] = 0.0f;
+    }
+    for (int64_t o = 0; o < O; o++) {
+        DB[o] = 0.0f;
+        for (int64_t ky = 0; ky < K; ky++) {
+            for (int64_t kx = 0; kx < K; kx++) {
+                DW[(o * K + ky) * K + kx] = 0.0f;
+            }
+        }
+    }
+    for (int64_t o = 0; o < O; o++) {
+        for (int64_t y = 0; y < H; y++) {
+            for (int64_t x = 0; x < W; x++) {
+                float d = DY[(o * H + y) * W + x];
+                DB[o] += d;
+                for (int64_t ky = 0; ky < K; ky++) {
+                    int64_t iy = y + ky - pad;
+                    if (iy < 0 || iy >= H) continue;
+                    for (int64_t kx = 0; kx < K; kx++) {
+                        int64_t ix = x + kx - pad;
+                        if (ix < 0 || ix >= W) continue;
+                        DW[(o * K + ky) * K + kx] += d * X[iy * W + ix];
+                        DX[iy * W + ix] += d * Wt[o * K * K + ky * K + kx];
+                    }
+                }
+            }
+        }
+    }
+}
+
+/* The gradient of the max pooling: every input position receives the
+ * gradient of the window whose maximum it was (the same tie breaking as the
+ * forward pass: the first of the greatest). */
+void mlr_maxpool2d_grad(const void *x, const void *dy, void *dx, int64_t O, int64_t H, int64_t W,
+                        int64_t k) {
+    const float *X = (const float *)x;
+    const float *DY = (const float *)dy;
+    float *DX = (float *)dx;
+    int64_t ho = H / k, wo = W / k;
+    for (int64_t i = 0; i < O * H * W; i++) {
+        DX[i] = 0.0f;
+    }
+    for (int64_t o = 0; o < O; o++) {
+        for (int64_t y = 0; y < ho; y++) {
+            for (int64_t x = 0; x < wo; x++) {
+                int64_t best_i = -1;
+                float best = -3.402823466e+38f;
+                for (int64_t ky = 0; ky < k; ky++) {
+                    for (int64_t kx = 0; kx < k; kx++) {
+                        int64_t i = (o * H + y * k + ky) * W + x * k + kx;
+                        if (X[i] > best) {
+                            best = X[i];
+                            best_i = i;
+                        }
+                    }
+                }
+                if (best_i >= 0) {
+                    DX[best_i] += DY[(o * ho + y) * wo + x];
+                }
+            }
+        }
+    }
+}
+
+/* The gradient of the embedding of one token: dtable is zero except for the
+ * row of the token, which is the incoming gradient. */
+void mlr_embed_grad(int32_t id, const void *dy, void *dtable, int64_t rows, int64_t width) {
+    float *T = (float *)dtable;
+    const float *DY = (const float *)dy;
+    for (int64_t i = 0; i < rows * width; i++) {
+        T[i] = 0.0f;
+    }
+    if (id < 0 || id >= rows) {
+        return;
+    }
+    memcpy(T + (int64_t)id * width, DY, (size_t)width * sizeof(float));
+}
+
+/* The gradient of the embedding of a sequence: the gradients of the rows
+ * whose token appears more than once are summed. */
+void mlr_embed_seq_grad(const void *ids, const void *dy, void *dtable, int64_t rows,
+                        int64_t width, int64_t count) {
+    const int32_t *I = (const int32_t *)ids;
+    const float *DY = (const float *)dy;
+    float *T = (float *)dtable;
+    for (int64_t i = 0; i < rows * width; i++) {
+        T[i] = 0.0f;
+    }
+    for (int64_t i = 0; i < count; i++) {
+        int32_t id = I[i];
+        if (id < 0 || id >= rows) {
+            continue;
+        }
+        float *row = T + (int64_t)id * width;
+        for (int64_t j = 0; j < width; j++) {
+            row[j] += DY[i * width + j];
+        }
+    }
+}
