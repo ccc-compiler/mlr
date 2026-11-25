@@ -663,6 +663,7 @@ impl IrBuilder {
                     crate::check::SysKind::ExecI => "mlr.exec_i",
                     crate::check::SysKind::ExecF => "mlr.exec_f",
                     crate::check::SysKind::ExecTensor => "mlr.exec_tensor",
+                    crate::check::SysKind::LoadRuntime => "mlr.load_runtime",
                     crate::check::SysKind::Assert => "mlr.assert",
                 };
                 let mut o = Op::new(name);

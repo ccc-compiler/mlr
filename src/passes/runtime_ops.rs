@@ -296,6 +296,11 @@ const RUNTIME: &[RuntimeFn] = &[
         result: Some("i64"),
     },
     RuntimeFn {
+        name: "mlr_load_runtime",
+        params: &["index", "index", "index", "index", "index"],
+        result: None,
+    },
+    RuntimeFn {
         name: "mlr_exec_tensor",
         params: &["index", "index", "index", "index", "index"],
         result: None,
@@ -608,6 +613,9 @@ fn lower_ops(
             }
             "mlr.exec_tensor" => {
                 lower_exec_tensor(op, used, &mut out, globals, counter)
+            }
+            "mlr.load_runtime" => {
+                lower_load_runtime(op, used, &mut out, globals, counter)
             }
             "mlr.assert" => lower_assert(op, used, &mut out, globals, counter),
             "mlr.zeros" => lower_zeros(op, used, &mut out),
@@ -3039,6 +3047,69 @@ fn lower_accuracy(op: Op, used: &mut Vec<&'static str>, out: &mut Vec<Op>) {
         cvocab.results[0].clone(),
     ];
     call.results.push(result);
+    out.push(call);
+}
+
+/// The runtime loading of a tensor: the path lives in a string global, the
+/// expected dimensions in an i64 global; the kernel checks both and fills
+/// the (writable) result buffer.
+fn lower_load_runtime(
+    op: Op,
+    used: &mut Vec<&'static str>,
+    out: &mut Vec<Op>,
+    globals: &mut Vec<crate::ir::Global>,
+    counter: &mut usize,
+) {
+    used.push("mlr_load_runtime");
+    let path = match op.attr("cmd") {
+        Some(Attr::Str(s)) => s.clone(),
+        _ => String::new(),
+    };
+    let result = op.results[0].clone();
+    let count = count(&result.ty);
+    let dims = dims(&result.ty);
+    let rank = dims.len() as i64;
+    let mut l = Lowerer { b: Builder::new() };
+    let pp = l.string_ptr(globals, counter, &path, out);
+    let dims_name = format!("__mlr_dims{}", *counter);
+    *counter += 1;
+    let dims_ty = Type::MemRef {
+        shape: vec![Dim::Static(rank)],
+        elem: Box::new(Type::Scalar(crate::ir::ScalarKind::I64)),
+    };
+    globals.push(crate::ir::Global {
+        name: dims_name.clone(),
+        ty: dims_ty.clone(),
+        value: Attr::DenseI64(dims),
+    });
+    let mut get = Op::new("memref.get_global");
+    get.attrs.push(("name".into(), Attr::Str(dims_name)));
+    let g = l.b.fresh_value(dims_ty.clone());
+    get.results.push(g.clone());
+    out.push(get);
+    let pdims = l.pointer(&g);
+    let pdims_v = pdims.results[0].clone();
+    out.push(pdims);
+    let out_ty = match &result.ty {
+        Type::MemRef { .. } => result.ty.clone(),
+        t => t.clone(),
+    };
+    let alloc = l.alloc(out_ty, &result);
+    out.push(alloc);
+    let pout = l.pointer(&result);
+    let pout_v = pout.results[0].clone();
+    out.push(pout);
+    let ccount = l.const_index(count);
+    let ccount_v = ccount.results[0].clone();
+    out.push(ccount);
+    let crank = l.const_index(rank);
+    let crank_v = crank.results[0].clone();
+    out.push(crank);
+    let mut call = Op::new("func.call");
+    call
+        .attrs
+        .push(("callee".into(), Attr::Str("mlr_load_runtime".into())));
+    call.operands = vec![pp, pdims_v, crank_v, pout_v, ccount_v];
     out.push(call);
 }
 

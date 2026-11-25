@@ -1543,6 +1543,47 @@ void mlr_exec_tensor(const char *cmd, int64_t n, const double *args, void *out, 
     }
 }
 
+/* The runtime loading of a tensor: the file carries the shape in a small
+ * header, so that the compiler only embeds the path.
+ *
+ *   [8 bytes: magic "MLRRWT01"]
+ *   [8 bytes: rank]
+ *   [rank * 8 bytes: the dimensions]
+ *   [count * 4 bytes: the elements, little endian f32 or i32]
+ */
+void mlr_load_runtime(const char *path, const int64_t *dims, int64_t rank, void *out,
+                      int64_t count) {
+    FILE *f = fopen(path, "rb");
+    if (!f) {
+        fprintf(stderr, "mlr: cannot open `%s`\n", path);
+        exit(1);
+    }
+    char magic[8];
+    if (fread(magic, 1, 8, f) != 8 || memcmp(magic, "MLRRWT01", 8) != 0) {
+        fprintf(stderr, "mlr: `%s` is not a raw tensor (the magic is missing)\n", path);
+        exit(1);
+    }
+    int64_t frank = 0;
+    if (fread(&frank, 8, 1, f) != 1 || frank != rank) {
+        fprintf(stderr, "mlr: `%s` has rank %lld, %lld was expected\n", path,
+                (long long)frank, (long long)rank);
+        exit(1);
+    }
+    for (int64_t i = 0; i < rank; i++) {
+        int64_t d = 0;
+        if (fread(&d, 8, 1, f) != 1 || d != dims[i]) {
+            fprintf(stderr, "mlr: `%s` has the dimension %lld at %lld, %lld was expected\n",
+                    path, (long long)d, (long long)i, (long long)dims[i]);
+            exit(1);
+        }
+    }
+    if (fread(out, 4, (size_t)count, f) != (size_t)count) {
+        fprintf(stderr, "mlr: `%s` is truncated\n", path);
+        exit(1);
+    }
+    fclose(f);
+}
+
 int64_t mlr_now_ms(void) {
     struct timespec ts;
     clock_gettime(CLOCK_REALTIME, &ts);

@@ -12,7 +12,7 @@ examples/mlp/mnist.mlr examples/mnist/mnist.mlr examples/gru/gru.mlr \
 examples/gpt/gpt.mlr examples/train/train_mlp.mlr \
 examples/train/train_cnn.mlr examples/train/train_gpt.mlr \
 examples/train/train_adam.mlr examples/train/train_mnist_full.mlr \
-examples/lib/lib.mlr"
+examples/train/train_runtime.mlr examples/lib/lib.mlr"
 
 pass=0
 fail=0

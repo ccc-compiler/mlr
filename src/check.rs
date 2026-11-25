@@ -373,6 +373,7 @@ pub enum SysKind {
     ExecI,
     ExecF,
     ExecTensor,
+    LoadRuntime,
     Assert,
 }
 
@@ -3073,6 +3074,69 @@ impl Checker {
                     return err("`mlr.load` expects a tensor type", span);
                 }
                 return Ok(TExpr::Load { path, key, ty });
+            }
+            "mlr.load_runtime" => {
+                if type_args.len() != 1 {
+                    return err("`mlr.load_runtime` takes exactly one type argument", span);
+                }
+                if args.is_empty() || args.len() > 2 {
+                    return err(
+                        "`mlr.load_runtime` takes the path of the file",
+                        span,
+                    );
+                }
+                let path = match &args[0] {
+                    Expr::Str(text, _) => text.clone(),
+                    _ => {
+                        return err(
+                            "`mlr.load_runtime` expects the path as a string literal",
+                            span,
+                        )
+                    }
+                };
+                let ty = self.resolve(&type_args[0], span);
+                // The elements are f32 or i32; the shape must be static (the
+                // runtime checks it against the header of the file).
+                match ty.dims() {
+                    Some(dims) => {
+                        for dim in dims {
+                            if matches!(dim, CDim::Dynamic) {
+                                return err(
+                                    "`mlr.load_runtime` needs a type with static dimensions",
+                                    span,
+                                );
+                            }
+                        }
+                    }
+                    None => {
+                        return err(
+                            format!(
+                                "`mlr.load_runtime` expects a tensor type, found {}",
+                                ty.print()
+                            ),
+                            span,
+                        )
+                    }
+                }
+                match ty.elem() {
+                    Some(CType::Scalar(ScalarKind::F32))
+                    | Some(CType::Scalar(ScalarKind::I32)) => {}
+                    _ => {
+                        return err(
+                            format!(
+                                "`mlr.load_runtime` expects f32 or i32 elements, found {}",
+                                ty.print()
+                            ),
+                            span,
+                        )
+                    }
+                }
+                return Ok(TExpr::Sys {
+                    kind: SysKind::LoadRuntime,
+                    cmd: path,
+                    args: vec![],
+                    ty,
+                });
             }
             "exec_tensor" => {
                 if type_args.len() != 1 {

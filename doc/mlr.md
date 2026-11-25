@@ -274,6 +274,23 @@ The examples end with `examples/gpt/gpt.mlr`, a causal transformer (two
 layers, two heads, gelu, layer normalization) that generates text byte by
 byte; its weights were trained with `tools/train_torch_models.py`.
 
+## Runtime loading
+
+`mlr.load` embeds the tensor into the program at compile time; for large
+models that makes the compilation slow. `mlr.load_runtime` reads the file
+**when the program runs** — the compiler only embeds the path, and the
+result is a writable tensor:
+
+```
+let w = mlr.load_runtime<Tensor<784x32xf32>>("model_w1.bin")
+```
+
+The file carries the shape in a small header (magic `MLRRWT01`, the rank,
+the dimensions, then the little endian f32/i32 values);
+`tools/to_raw.py` converts a `.safetensors` or `.npy` file. A `hf://` path
+is resolved at compile time (the file is downloaded into the cache once),
+so the run needs no network.
+
 ## Standard library
 
 The tensor functions of the runtime (see [lib.md](lib.md) for the full list):

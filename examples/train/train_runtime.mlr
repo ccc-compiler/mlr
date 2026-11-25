@@ -1,0 +1,54 @@
+// Training with runtime-loaded weights: `mlr.load_runtime` reads the raw
+// format (a small header with the shape, then the values) when the program
+// runs — the compiler only embeds the path, so the size of the model does
+// not affect the compilation. The initial weights come from the same random
+// values as `train_mlp` (converted to the raw format), the update is plain
+// gradient descent on mini-batches, and the trained weights are written
+// back with `mlr.save_pt`.
+
+fn loss(
+    w1: Tensor<784x32xf32>,
+    b1: Tensor<32xf32>,
+    w2: Tensor<32x10xf32>,
+    b2: Tensor<10xf32>,
+    x: Tensor<10x784xf32>,
+    y: Tensor<10xi32>
+) -> f32 {
+    let h = relu(add_bias(matmul(x, w1), b1))
+    let logits = add_bias(matmul(h, w2), b2)
+    yield cross_entropy(logits, y)
+}
+
+fn main() {
+    let images = mlr.load<Tensor<100x784xf32>>("examples/train/images.bin")
+    let labels = mlr.load<Tensor<100xi32>>("examples/train/labels.bin")
+
+    // The weights are read when the program runs.
+    let (w1, b1, w2, b2) = for step in 0..200 step 1 iter(
+        w1 = mlr.load_runtime<Tensor<784x32xf32>>("examples/train/aw1_rt.bin"),
+        b1 = mlr.load_runtime<Tensor<32xf32>>("examples/train/ab1_rt.bin"),
+        w2 = mlr.load_runtime<Tensor<32x10xf32>>("examples/train/aw2_rt.bin"),
+        b2 = mlr.load_runtime<Tensor<10xf32>>("examples/train/ab2_rt.bin")
+    ) {
+        let perm = rand_permutation(100, step + 7)
+        let idx = rows(perm, 0, 10)
+        let x = gather(images, idx)
+        let y = gather(labels, idx)
+        let (l, dw1, db1, dw2, db2, _, _) = value_and_grad(loss, w1, b1, w2, b2, x, y)
+        if step % 40 == 0 {
+            print(l)
+        }
+        yield map(w1, dw1) |a, g| { yield a - 0.3 * g },
+              map(b1, db1) |a, g| { yield a - 0.3 * g },
+              map(w2, dw2) |a, g| { yield a - 0.3 * g },
+              map(b2, db2) |a, g| { yield a - 0.3 * g }
+    }
+
+    // The trained weights are written back as a PyTorch checkpoint.
+    mlr.save_pt("examples/train/runtime_trained.pt",
+        w1, "w1", b1, "b1", w2, "w2", b2, "b2")
+
+    let hidden = relu(add_bias(matmul(images, w1), b1))
+    let logits = add_bias(matmul(hidden, w2), b2)
+    print(accuracy(logits, labels))
+}

@@ -803,6 +803,37 @@ fn main() {
 }
 
 #[test]
+fn loads_a_tensor_at_runtime() {
+    // A raw tensor file (the format of `tools/to_raw.py`), loaded when the
+    // program runs; the same data loaded at compile time must agree, and
+    // the runtime tensor must be writable.
+    let Some(out) = run(
+        r#"
+fn main() {
+    let w = mlr.load_runtime<Tensor<784x32xf32>>("examples/train/aw1_rt.bin")
+    let c = mlr.load<Tensor<784x32xf32>>("examples/train/aw1.bin")
+    let d = map(w, c) |a, b| {
+        yield a - b
+    }
+    print(sum(d))
+    let w2 = map(w) |a| {
+        yield a + 1.0
+    }
+    print(tensor.extract(w2, [0, 0]) - tensor.extract(w, [0, 0]))
+}
+"#,
+    ) else {
+        eprintln!("skipping: the LLVM tool chain is not available");
+        return;
+    };
+    let lines: Vec<f32> = out.lines().map(|l| l.parse().unwrap()).collect();
+    // The runtime load and the compile-time load agree.
+    assert_eq!(lines[0], 0.0, "{}", out);
+    // The runtime tensor is writable.
+    assert_eq!(lines[1], 1.0, "{}", out);
+}
+
+#[test]
 fn reads_a_tensor_from_the_shell() {
     let Some(out) = run(
         r#"

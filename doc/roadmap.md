@@ -1,6 +1,6 @@
 # 設計提案：MLR 的改良路線（v0.3）
 
-> 狀態：**步驟 1–3 已完成**（v0.2）；§4 執行期載入與 §5 平行化待做。
+> 狀態：**步驟 1–4 已完成**（v0.2）；§5 平行化與 §6 表驅動重構待做。
 >
 > 完成記錄：
 > * §1 NaN bug——確認已在 bufferize 的 const/params 排除中修復，補了兩個
@@ -243,6 +243,6 @@ struct LowerSpec {
 | -- | ---- | ---- |
 | 1 | §1 NaN bug + §3 verifier | **完成** |
 | 2 | §2 for 解包（`train_adam`/`train_mnist_full` 改寫為解包版） | **完成** |
-| 3 | §4 執行期載入（方案 b：raw + 檔頭） | 一天 |
+| 3 | §4 執行期載入（方案 b：raw + 檔頭） | **完成**：`mlr.load_runtime`（raw 格式 + `tools/to_raw.py` 轉檔 + `hf://` 編譯期解析）；`examples/train/train_runtime.mlr` 訓練閉環（runtime 載入 → 訓練 → `save_pt` → torch 驗證） |
 | 4 | §5 平行化（旗標 → OpenMP → MPS 反向） | 半天起 |
 | 5 | §6 表驅動重構 | 半天 |
