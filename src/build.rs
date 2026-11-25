@@ -203,14 +203,17 @@ impl IrBuilder {
                     continue;
                 }
             };
-            if let Err(e) = crate::passes::autodiff::check_differentiable(&f) {
+            if let Err(e) =
+                crate::passes::autodiff::check_differentiable(&f, &module.funcs)
+            {
                 self.errors
                     .push(format!("`{}` cannot be differentiated: {}", name, e));
                 continue;
             }
             // The runtime declarations of the gradient functions are added
             // by the lowering of the domain operations (stage 5).
-            let (grad_fn, _used) = crate::passes::autodiff::value_and_grad_of(&f);
+            let (grad_fn, _used) =
+                crate::passes::autodiff::value_and_grad_of(&f, &module.funcs);
             module.funcs.push(grad_fn);
         }
         for r in &self.runtime {

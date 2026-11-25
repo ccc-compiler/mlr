@@ -123,7 +123,9 @@ pub enum DomainOp {
     MatMul,
     CrossEntropy,
     Softmax,
+    SoftmaxTri,
     Sum,
+    Add,
     Conv2d,
     MaxPool2d,
     Relu,
@@ -145,7 +147,9 @@ impl DomainOp {
             DomainOp::MatMul => "matmul",
             DomainOp::CrossEntropy => "cross_entropy",
             DomainOp::Softmax => "softmax",
+            DomainOp::SoftmaxTri => "softmax_tri",
             DomainOp::Sum => "sum",
+            DomainOp::Add => "add",
             DomainOp::Conv2d => "conv2d",
             DomainOp::MaxPool2d => "maxpool2d",
             DomainOp::Relu => "relu",
@@ -388,6 +392,13 @@ fn coerce(expr: &TExpr, target: &CType) -> Option<TExpr> {
     match (expr, target) {
         (TExpr::ConstInt(v, _), CType::Scalar(k)) if k.is_int() => {
             Some(TExpr::ConstInt(*v, CType::Scalar(*k)))
+        }
+        (TExpr::ConstInt(v, _), CType::Index) => {
+            Some(TExpr::Cast {
+                value: Box::new(TExpr::ConstInt(*v, CType::Scalar(ScalarKind::I32))),
+                from: CType::Scalar(ScalarKind::I32),
+                to: CType::Index,
+            })
         }
         (TExpr::ConstInt(v, _), CType::Scalar(k)) if k.is_float() => {
             Some(TExpr::ConstFloat(*v as f64, CType::Scalar(*k)))
@@ -1698,6 +1709,26 @@ impl Checker {
             };
             return Ok((l, c, lt));
         }
+        // Two floats of different widths: the computation runs in the
+        // narrower type, which is the type of the runtime.
+        if let (CType::Scalar(a), CType::Scalar(b)) = (&lt, &rt) {
+            if a.is_float() && b.is_float() && a != b {
+                if a.width() < b.width() {
+                    let c = TExpr::Cast {
+                        value: Box::new(r),
+                        from: rt.clone(),
+                        to: lt.clone(),
+                    };
+                    return Ok((l, c, lt));
+                }
+                let c = TExpr::Cast {
+                    value: Box::new(l),
+                    from: lt.clone(),
+                    to: rt.clone(),
+                };
+                return Ok((c, r, rt));
+            }
+        }
         // An integer is converted to a float when it meets one.
         if let (CType::Scalar(a), CType::Scalar(b)) = (&lt, &rt) {
             if a.is_int() && b.is_float() {
@@ -1752,7 +1783,9 @@ impl Checker {
             "softmax_causal" => DomainOp::SoftmaxCausal,
             "cross_entropy" => DomainOp::CrossEntropy,
             "softmax" => DomainOp::Softmax,
+            "softmax_tri" => DomainOp::SoftmaxTri,
             "sum" => DomainOp::Sum,
+            "add" => DomainOp::Add,
             "sample" => DomainOp::Sample,
             _ => unreachable!(),
         };
@@ -1807,6 +1840,18 @@ impl Checker {
             let e = elem(t)?;
             Ok((d, e))
         };
+        // A row of a tensor of any element type.
+        let row_tensor = |t: &CType| -> Result<(Vec<i64>, CType), Error> {
+            if !t.is_tensor() {
+                return err(
+                    format!("`{}` expects tensors, found {}", name, t.print()),
+                    span,
+                );
+            }
+            let d = dims(t)?;
+            let e = t.elem().cloned().unwrap();
+            Ok((d, e))
+        };
         // A tensor of integers, used for the indices of a table.
         let tensor_int = |t: &CType| -> Result<(Vec<i64>, CType), Error> {
             if !t.is_tensor() {
@@ -1854,6 +1899,60 @@ impl Checker {
             // Checked by `check_cross_entropy`, which the dispatch calls
             // before this match.
             DomainOp::CrossEntropy => unreachable!(),
+            DomainOp::SoftmaxTri => {
+                // softmax_tri(x: Tensor<NxNxf32>) -> Tensor<NxNxf32>: the
+                // softmax of the rows with a causal mask, the attention of a
+                // decoder.
+                if targs.len() != 1 {
+                    return err("`softmax_tri` takes one matrix", span);
+                }
+                let (d, e) = tensor(&targs[0].ty())?;
+                if d.len() != 2 {
+                    return err("`softmax_tri` expects a matrix", span);
+                }
+                if e != CType::Scalar(ScalarKind::F32) {
+                    return err(
+                        format!("`softmax_tri` expects a matrix of f32, found {}", e.print()),
+                        span,
+                    );
+                }
+                (
+                    CType::Tensor {
+                        dims: d.iter().map(|v| CDim::Static(*v)).collect(),
+                        elem: Box::new(CType::Scalar(ScalarKind::F32)),
+                    },
+                    vec![],
+                )
+            }
+            DomainOp::Add => {
+                // add(a, b): the element wise sum of two tensors of the same
+                // shape.
+                if targs.len() != 2 {
+                    return err("`add` takes two tensors", span);
+                }
+                let (da, ea) = tensor(&targs[0].ty())?;
+                let (db, eb) = tensor(&targs[1].ty())?;
+                if ea != CType::Scalar(ScalarKind::F32) || eb != CType::Scalar(ScalarKind::F32) {
+                    return err("`add` expects tensors of f32", span);
+                }
+                if da != db {
+                    return err(
+                        format!(
+                            "`add` expects tensors of the same shape, found {} and {}",
+                            targs[0].ty().print(),
+                            targs[1].ty().print()
+                        ),
+                        span,
+                    );
+                }
+                (
+                    CType::Tensor {
+                        dims: da.iter().map(|v| CDim::Static(*v)).collect(),
+                        elem: Box::new(CType::Scalar(ScalarKind::F32)),
+                    },
+                    vec![],
+                )
+            }
             DomainOp::Sum => {
                 // sum(t: Tensor<...xf32>) -> f32
                 if targs.len() != 1 {
@@ -2008,7 +2107,9 @@ impl Checker {
                 if targs.len() != 2 {
                     return err("`row` takes a tensor and an index", span);
                 }
-                let (d, e) = tensor(&targs[0].ty())?;
+                // A row keeps the element type: the rows of a table of
+                // indices are indices too.
+                let (d, e) = row_tensor(&targs[0].ty())?;
                 if d.len() < 2 {
                     return err("`row` expects a tensor of rank 2 or more", span);
                 }
@@ -2513,7 +2614,11 @@ impl Checker {
             }
             "matmul" | "conv2d" | "maxpool2d" | "relu" | "flatten" | "row" | "argmax"
             | "add_bias" | "embed" | "embed_seq" | "transpose" | "layernorm"
-            | "softmax_causal" | "sample" | "cross_entropy" | "softmax" | "sum" => {
+            | "softmax_causal" | "sample" | "cross_entropy" | "softmax" | "sum"
+            | "softmax_tri" | "add"
+                if !self.sigs.contains_key(name) =>
+            {
+                // A function of the program shadows the builtin.
                 return self.check_domain(name, args, span);
             }
             "print" => {

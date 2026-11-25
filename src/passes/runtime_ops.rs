@@ -169,6 +169,28 @@ const RUNTIME: &[RuntimeFn] = &[
         result: None,
     },
     RuntimeFn {
+        name: "mlr_layernorm_grad",
+        params: &[
+            "index", "index", "index", "index", "index", "index", "index", "index",
+        ],
+        result: None,
+    },
+    RuntimeFn {
+        name: "mlr_softmax_grad",
+        params: &["index", "index", "index", "index", "index"],
+        result: None,
+    },
+    RuntimeFn {
+        name: "mlr_softmax_tri",
+        params: &["index", "index", "index"],
+        result: None,
+    },
+    RuntimeFn {
+        name: "mlr_softmax_tri_grad",
+        params: &["index", "index", "index", "index"],
+        result: None,
+    },
+    RuntimeFn {
         name: "mlr_relu_grad",
         params: &["index", "index", "index", "index"],
         result: None,
@@ -271,6 +293,10 @@ fn lower_ops(
             "mlr.embed_seq_grad" => lower_embed_seq_grad(op, used, &mut out),
             "mlr.cross_entropy_grad" => lower_cross_entropy_grad(op, used, &mut out),
             "mlr.softmax" => lower_softmax(op, used, &mut out),
+            "mlr.softmax_tri" => lower_softmax_tri(op, used, &mut out),
+            "mlr.softmax_grad" => lower_softmax_grad(op, used, &mut out),
+            "mlr.softmax_tri_grad" => lower_softmax_tri_grad(op, used, &mut out),
+            "mlr.layernorm_grad" => lower_layernorm_grad(op, used, &mut out),
             "mlr.zeros" => lower_zeros(op, used, &mut out),
             "mlr.add" => lower_add_elem(op, used, &mut out),
             "mlr.matmul_grad" => lower_matmul_grad(op, used, &mut out),
@@ -573,12 +599,11 @@ fn lower_row(op: Op, used: &mut Vec<&'static str>, out: &mut Vec<Op>) {
     let stride: i64 = dt[1..].iter().product();
     let n = count(&result.ty);
     let mut l = Lowerer { b: Builder::new() };
-    let out_ty = Type::MemRef {
-        shape: match &result.ty {
-            Type::MemRef { shape, .. } => shape.clone(),
-            _ => vec![Dim::Static(n)],
-        },
-        elem: Box::new(Type::Scalar(crate::ir::ScalarKind::F32)),
+    // The row keeps the element type of the tensor: the rows of a table of
+    // indices are indices.
+    let out_ty = match &result.ty {
+        Type::MemRef { .. } => result.ty.clone(),
+        t => t.clone(),
     };
     out.push(l.alloc(out_ty, &result));
     let pt = l.pointer(&t);
@@ -1552,6 +1577,165 @@ fn lower_embed_seq_grad(op: Op, used: &mut Vec<&'static str>, out: &mut Vec<Op>)
         crows.results[0].clone(),
         cwidth.results[0].clone(),
         ccount.results[0].clone(),
+    ];
+    out.push(call);
+}
+
+/// The masked softmax of the rows: (x) -> y, square matrix.
+fn lower_softmax_tri(op: Op, used: &mut Vec<&'static str>, out: &mut Vec<Op>) {
+    used.push("mlr_softmax_tri");
+    let x = op.operands[0].clone();
+    let result = op.results[0].clone();
+    let size = dims(&x.ty)[0];
+    let mut l = Lowerer { b: Builder::new() };
+    let out_ty = match &result.ty {
+        Type::MemRef { .. } => result.ty.clone(),
+        t => t.clone(),
+    };
+    out.push(l.alloc(out_ty, &result));
+    let px = l.pointer(&x);
+    let pout = l.pointer(&result);
+    let csize = l.const_index(size);
+    out.push(px.clone());
+    out.push(pout.clone());
+    out.push(csize.clone());
+    let mut call = Op::new("func.call");
+    call
+        .attrs
+        .push(("callee".into(), Attr::Str("mlr_softmax_tri".into())));
+    call.operands = vec![
+        px.results[0].clone(),
+        pout.results[0].clone(),
+        csize.results[0].clone(),
+    ];
+    out.push(call);
+}
+
+/// The gradient of a row softmax: (y, dy) -> dx, with y the output of the
+/// forward pass.
+fn lower_softmax_grad(op: Op, used: &mut Vec<&'static str>, out: &mut Vec<Op>) {
+    used.push("mlr_softmax_grad");
+    let y = op.operands[0].clone();
+    let dy = op.operands[1].clone();
+    let result = op.results[0].clone();
+    let d = dims(&y.ty);
+    let (rows, cols) = (d[0], d[1]);
+    let mut l = Lowerer { b: Builder::new() };
+    let out_ty = match &result.ty {
+        Type::MemRef { .. } => result.ty.clone(),
+        t => t.clone(),
+    };
+    out.push(l.alloc(out_ty, &result));
+    let py = l.pointer(&y);
+    let pdy = l.pointer(&dy);
+    let pout = l.pointer(&result);
+    let crows = l.const_index(rows);
+    let ccols = l.const_index(cols);
+    out.push(py.clone());
+    out.push(pdy.clone());
+    out.push(pout.clone());
+    out.push(crows.clone());
+    out.push(ccols.clone());
+    let mut call = Op::new("func.call");
+    call
+        .attrs
+        .push(("callee".into(), Attr::Str("mlr_softmax_grad".into())));
+    call.operands = vec![
+        py.results[0].clone(),
+        pdy.results[0].clone(),
+        pout.results[0].clone(),
+        crows.results[0].clone(),
+        ccols.results[0].clone(),
+    ];
+    out.push(call);
+}
+
+/// The gradient of the masked softmax of a square matrix: (y, dy) -> dx.
+fn lower_softmax_tri_grad(op: Op, used: &mut Vec<&'static str>, out: &mut Vec<Op>) {
+    used.push("mlr_softmax_tri_grad");
+    let y = op.operands[0].clone();
+    let dy = op.operands[1].clone();
+    let result = op.results[0].clone();
+    let size = dims(&y.ty)[0];
+    let mut l = Lowerer { b: Builder::new() };
+    let out_ty = match &result.ty {
+        Type::MemRef { .. } => result.ty.clone(),
+        t => t.clone(),
+    };
+    out.push(l.alloc(out_ty, &result));
+    let py = l.pointer(&y);
+    let pdy = l.pointer(&dy);
+    let pout = l.pointer(&result);
+    let csize = l.const_index(size);
+    out.push(py.clone());
+    out.push(pdy.clone());
+    out.push(pout.clone());
+    out.push(csize.clone());
+    let mut call = Op::new("func.call");
+    call
+        .attrs
+        .push(("callee".into(), Attr::Str("mlr_softmax_tri_grad".into())));
+    call.operands = vec![
+        py.results[0].clone(),
+        pdy.results[0].clone(),
+        pout.results[0].clone(),
+        csize.results[0].clone(),
+    ];
+    out.push(call);
+}
+
+/// The gradients of the layer normalization: (x, g, dy) -> (dx, dg, db).
+fn lower_layernorm_grad(op: Op, used: &mut Vec<&'static str>, out: &mut Vec<Op>) {
+    used.push("mlr_layernorm_grad");
+    #[allow(unused_mut)]
+    let x = op.operands[0].clone();
+    let g = op.operands[1].clone();
+    let dy = op.operands[2].clone();
+    let dx = op.results[0].clone();
+    let dg = op.results[1].clone();
+    let db = op.results[2].clone();
+    let d = dims(&x.ty);
+    let (rows, width) = (d[0], d[1]);
+    let mut l = Lowerer { b: Builder::new() };
+    let mut alloc_of = |v: &Value| -> Op {
+        let ty = match &v.ty {
+            Type::MemRef { .. } => v.ty.clone(),
+            t => t.clone(),
+        };
+        l.alloc(ty, v)
+    };
+    out.push(alloc_of(&dx));
+    out.push(alloc_of(&dg));
+    out.push(alloc_of(&db));
+    let px = l.pointer(&x);
+    let pg = l.pointer(&g);
+    let pdy = l.pointer(&dy);
+    let pdx = l.pointer(&dx);
+    let pdg = l.pointer(&dg);
+    let pdb = l.pointer(&db);
+    let crows = l.const_index(rows);
+    let cwidth = l.const_index(width);
+    out.push(px.clone());
+    out.push(pg.clone());
+    out.push(pdy.clone());
+    out.push(pdx.clone());
+    out.push(pdg.clone());
+    out.push(pdb.clone());
+    out.push(crows.clone());
+    out.push(cwidth.clone());
+    let mut call = Op::new("func.call");
+    call
+        .attrs
+        .push(("callee".into(), Attr::Str("mlr_layernorm_grad".into())));
+    call.operands = vec![
+        px.results[0].clone(),
+        pg.results[0].clone(),
+        pdy.results[0].clone(),
+        pdx.results[0].clone(),
+        pdg.results[0].clone(),
+        pdb.results[0].clone(),
+        crows.results[0].clone(),
+        cwidth.results[0].clone(),
     ];
     out.push(call);
 }

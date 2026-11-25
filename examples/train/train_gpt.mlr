@@ -1,0 +1,118 @@
+// Fine tuning the language model head of the GPT inside MLR.
+//
+// The transformer of `examples/gpt` is frozen: its weights are embedded as
+// constants inside the loss. The parameters of the training are the language
+// model head and the final layer normalization; they are carried by the
+// loop, updated with gradient descent and written back with `mlr.save_pt`.
+//
+// The windows of the corpus (`examples/train/gpt_x.bin` and `gpt_y.bin`)
+// hold sixteen tokens each; the loss is the cross entropy of the next token
+// at every position.
+
+// The forward pass of the frozen transformer: two blocks with two heads.
+fn transformer(ids: Tensor<16xi32>) -> Tensor<16x32xf32> {
+    let wte = mlr.load<Tensor<66x32xf32>>("examples/gpt/wte.bin")
+    let wpe = mlr.load<Tensor<16x32xf32>>("examples/gpt/wpe.bin")
+    let x = add(embed_seq(wte, ids), wpe)
+
+    // The first block.
+    let h = layernorm(x,
+        mlr.load<Tensor<32xf32>>("examples/gpt/layer0_ln1_g.bin"),
+        mlr.load<Tensor<32xf32>>("examples/gpt/layer0_ln1_b.bin"))
+    let q0 = matmul(h, mlr.load<Tensor<32x16xf32>>("examples/gpt/layer0_wq0.bin"))
+    let k0 = matmul(h, mlr.load<Tensor<32x16xf32>>("examples/gpt/layer0_wk0.bin"))
+    let v0 = matmul(h, mlr.load<Tensor<32x16xf32>>("examples/gpt/layer0_wv0.bin"))
+    let q1 = matmul(h, mlr.load<Tensor<32x16xf32>>("examples/gpt/layer0_wq1.bin"))
+    let k1 = matmul(h, mlr.load<Tensor<32x16xf32>>("examples/gpt/layer0_wk1.bin"))
+    let v1 = matmul(h, mlr.load<Tensor<32x16xf32>>("examples/gpt/layer0_wv1.bin"))
+    let p0 = softmax_tri(map(matmul(q0, transpose(k0))) |e| {
+        yield e * 0.25
+    })
+    let p1 = softmax_tri(map(matmul(q1, transpose(k1))) |e| {
+        yield e * 0.25
+    })
+    let m0 = matmul(matmul(p0, v0), mlr.load<Tensor<16x32xf32>>("examples/gpt/layer0_wproj0.bin"))
+    let m1 = matmul(matmul(p1, v1), mlr.load<Tensor<16x32xf32>>("examples/gpt/layer0_wproj1.bin"))
+    let x2 = add(x, add(m0, m1))
+    let h2 = layernorm(x2,
+        mlr.load<Tensor<32xf32>>("examples/gpt/layer0_ln2_g.bin"),
+        mlr.load<Tensor<32xf32>>("examples/gpt/layer0_ln2_b.bin"))
+    let g2 = map(matmul(h2, mlr.load<Tensor<32x128xf32>>("examples/gpt/layer0_fc1.bin"))) |e| {
+        yield gelu(e)
+    }
+    let x3 = add(x2, matmul(g2, mlr.load<Tensor<128x32xf32>>("examples/gpt/layer0_fc2.bin")))
+
+    // The second block.
+    let hb = layernorm(x3,
+        mlr.load<Tensor<32xf32>>("examples/gpt/layer1_ln1_g.bin"),
+        mlr.load<Tensor<32xf32>>("examples/gpt/layer1_ln1_b.bin"))
+    let bq0 = matmul(hb, mlr.load<Tensor<32x16xf32>>("examples/gpt/layer1_wq0.bin"))
+    let bk0 = matmul(hb, mlr.load<Tensor<32x16xf32>>("examples/gpt/layer1_wk0.bin"))
+    let bv0 = matmul(hb, mlr.load<Tensor<32x16xf32>>("examples/gpt/layer1_wv0.bin"))
+    let bq1 = matmul(hb, mlr.load<Tensor<32x16xf32>>("examples/gpt/layer1_wq1.bin"))
+    let bk1 = matmul(hb, mlr.load<Tensor<32x16xf32>>("examples/gpt/layer1_wk1.bin"))
+    let bv1 = matmul(hb, mlr.load<Tensor<32x16xf32>>("examples/gpt/layer1_wv1.bin"))
+    let bp0 = softmax_tri(map(matmul(bq0, transpose(bk0))) |e| {
+        yield e * 0.25
+    })
+    let bp1 = softmax_tri(map(matmul(bq1, transpose(bk1))) |e| {
+        yield e * 0.25
+    })
+    let bm0 = matmul(matmul(bp0, bv0), mlr.load<Tensor<16x32xf32>>("examples/gpt/layer1_wproj0.bin"))
+    let bm1 = matmul(matmul(bp1, bv1), mlr.load<Tensor<16x32xf32>>("examples/gpt/layer1_wproj1.bin"))
+    let x4 = add(x3, add(bm0, bm1))
+    let h4 = layernorm(x4,
+        mlr.load<Tensor<32xf32>>("examples/gpt/layer1_ln2_g.bin"),
+        mlr.load<Tensor<32xf32>>("examples/gpt/layer1_ln2_b.bin"))
+    let g4 = map(matmul(h4, mlr.load<Tensor<32x128xf32>>("examples/gpt/layer1_fc1.bin"))) |e| {
+        yield gelu(e)
+    }
+    yield add(x4, matmul(g4, mlr.load<Tensor<128x32xf32>>("examples/gpt/layer1_fc2.bin")))
+}
+
+// The loss of one window: the transformer is frozen, the head is trained.
+fn loss(
+    head: Tensor<32x66xf32>,
+    lnf_g: Tensor<32xf32>,
+    lnf_b: Tensor<32xf32>,
+    ids: Tensor<16xi32>,
+    y: Tensor<16xi32>
+) -> f32 {
+    let x = transformer(ids)
+    let h = layernorm(x, lnf_g, lnf_b)
+    yield cross_entropy(matmul(h, head), y)
+}
+
+// The parameters of the training, bundled for the loop.
+struct Head {
+    head: Tensor<32x66xf32>,
+    lnf_g: Tensor<32xf32>,
+    lnf_b: Tensor<32xf32>
+}
+
+fn main() {
+    let head0 = mlr.load<Tensor<32x66xf32>>("examples/gpt/lm_head.bin")
+    let lnf_g0 = mlr.load<Tensor<32xf32>>("examples/gpt/ln_f_g.bin")
+    let lnf_b0 = mlr.load<Tensor<32xf32>>("examples/gpt/ln_f_b.bin")
+    let start = Head { head: head0, lnf_g: lnf_g0, lnf_b: lnf_b0 }
+    let xs = mlr.load<Tensor<2x16xi32>>("examples/train/gpt_x.bin")
+    let ys = mlr.load<Tensor<2x16xi32>>("examples/train/gpt_y.bin")
+
+    // Gradient descent over the two windows, one window per step.
+    let trained = for step in 0..60 step 1 iter(state = start) {
+        let ids = row(xs, step % 2)
+        let y = row(ys, step % 2)
+        let (l, dhead, dg, db, _, _) = value_and_grad(
+            loss, state.head, state.lnf_g, state.lnf_b, ids, y
+        )
+        if step % 20 == 0 {
+            print(l)
+        }
+        yield state with {
+            head: map(state.head, dhead) |a, g| { yield a - 0.5 * g },
+            lnf_g: map(state.lnf_g, dg) |a, g| { yield a - 0.5 * g },
+            lnf_b: map(state.lnf_b, db) |a, g| { yield a - 0.5 * g }
+        }
+    }
+    mlr.save_pt("examples/train/gpt_tuned.pt", trained.head, "lm_head")
+}

@@ -10,7 +10,8 @@ cd "$root"
 examples="examples/scalar.mlr examples/tensor.mlr examples/features.mlr \
 examples/mlp/mnist.mlr examples/mnist/mnist.mlr examples/gru/gru.mlr \
 examples/gpt/gpt.mlr examples/train/train_mlp.mlr \
-examples/train/train_cnn.mlr"
+examples/train/train_cnn.mlr examples/train/train_gpt.mlr \
+examples/train/train_adam.mlr"
 
 pass=0
 fail=0

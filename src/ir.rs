@@ -299,7 +299,14 @@ impl Attr {
                 let _ = write!(out, "{}", v);
             }
             Attr::Float(v) => {
-                let _ = write!(out, "{:?}", v);
+                let spelling = format!("{:?}", v);
+                if spelling.contains('e') {
+                    // MLIR reads `1e-8` as an identifier; a decimal spelling
+                    // is always accepted.
+                    let _ = write!(out, "{:.20}", v);
+                } else {
+                    out.push_str(&spelling);
+                }
             }
             Attr::Str(s) => {
                 let _ = write!(out, "\"{}\"", s);
@@ -828,7 +835,14 @@ impl Printer {
                         let _ = write!(out, "{}", v);
                     }
                     Some(Attr::Float(v)) => {
-                        let _ = write!(out, "{:?}", v);
+                        // The same spelling as the attribute: MLIR reads
+                        // `1e-8` as an identifier.
+                        let spelling = format!("{:?}", v);
+                        if spelling.contains('e') {
+                            let _ = write!(out, "{:.20}", v);
+                        } else {
+                            out.push_str(&spelling);
+                        }
                     }
                     Some(Attr::Bool(b)) => {
                         let _ = write!(out, "{}", if *b { 1 } else { 0 });

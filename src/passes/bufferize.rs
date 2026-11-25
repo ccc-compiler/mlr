@@ -19,6 +19,9 @@ use std::collections::HashMap;
 use crate::ir::{Attr, Builder, Dim, Op, Region, Type, Value};
 
 pub fn bufferize(module: &mut crate::ir::Module) {
+    // The names of the constants are unique across the functions of the
+    // module.
+    let mut global_index = 0usize;
     for f in &mut module.funcs {
         let counts = use_counts(f);
         let mut b = Bufferizer {
@@ -26,13 +29,19 @@ pub fn bufferize(module: &mut crate::ir::Module) {
             map: HashMap::new(),
             counts,
             globals: Vec::new(),
-            global_index: 0,
+            global_index,
             consts: std::collections::HashSet::new(),
+            params: std::collections::HashSet::new(),
         };
         // Function signature: tensors become memrefs.
         for p in &mut f.params {
             p.ty = memref_of(&p.ty);
         }
+        let mut params = std::collections::HashSet::new();
+        for p in &f.params {
+            params.insert(p.id);
+        }
+        b.params = params;
         for r in &mut f.results {
             *r = memref_of(r);
         }
@@ -42,6 +51,7 @@ pub fn bufferize(module: &mut crate::ir::Module) {
         let mut ops = Vec::new();
         b.rewrite_block(&f.body.blocks[0].ops, &mut ops);
         f.body.blocks[0].ops = ops;
+        global_index = b.global_index;
         module.globals.extend(b.globals.clone());
     }
 }
@@ -87,6 +97,9 @@ struct Bufferizer {
     /// The values that refer to a constant global buffer, which must be
     /// copied before they are written.
     consts: std::collections::HashSet<usize>,
+    /// The parameters of the function that is being bufferized; they may
+    /// alias values of the caller that must not be written.
+    params: std::collections::HashSet<usize>,
 }
 
 impl Bufferizer {
@@ -327,11 +340,16 @@ impl Bufferizer {
         let in_bufs: Vec<Value> = ins.iter().map(|t| self.buffer_of(t)).collect();
 
         // In-place reuse: if an input is not read again afterwards the buffer
-        // can be written in place.
+        // can be written in place. A parameter of the function is excluded:
+        // the caller may pass a value that must not be written (a constant);
+        // so is a value that was derived from a constant.
         let mut out_buf: Option<Value> = None;
         if ins_count == 1 {
             if let Some(t) = ins.first() {
-                if self.counts.get(&t.id).copied().unwrap_or(0) <= 1 {
+                if self.counts.get(&t.id).copied().unwrap_or(0) <= 1
+                    && !self.params.contains(&in_bufs[0].id)
+                    && !self.consts.contains(&in_bufs[0].id)
+                {
                     out_buf = Some(in_bufs[0].clone());
                 }
             }

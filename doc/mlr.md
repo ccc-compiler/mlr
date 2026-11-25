@@ -211,6 +211,8 @@ Metal Performance Shaders implementation.
 | `softmax(x)`                | `Tensor<MxNxf32>` → `Tensor<MxNxf32>`           | the softmax of every row |
 | `cross_entropy(logits, y)`  | `Tensor<MxVxf32>`, `Tensor<Mxi32>` → `f32`      | the mean cross entropy of the rows |
 | `sum(x)`                    | any tensor → `f32`                              | the sum of the elements |
+| `add(a, b)`                 | two tensors of the same shape                   | the element wise sum |
+| `softmax_tri(x)`            | `Tensor<NxNxf32>` → `Tensor<NxNxf32>`           | the softmax of the rows with a causal mask (decoder attention) |
 | `sample(x, t, seed)`        | `Tensor<Nxf32>`, `f32`, `i32` → `i32`           | a token drawn from the softmax of the logits at temperature `t` |
 
 A vector counts as a matrix with a single row, and an image may be written

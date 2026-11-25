@@ -29,13 +29,19 @@ const FORWARD: &[&str] = &[
     "mlr.embed",
     "mlr.embed_seq",
     "mlr.flatten",
+    "mlr.layernorm",
+    "mlr.transpose",
+    "mlr.softmax",
+    "mlr.softmax_tri",
+    "mlr.add",
+    "mlr.map",
     "func.return",
 ];
 
 /// Builds `f.value_and_grad` from the IR of `f`: the loss and one gradient
 /// slot per tensor parameter. Returns the function and the runtime functions
 /// it calls (for the declarations of the module).
-pub fn value_and_grad_of(f: &FuncOp) -> (FuncOp, Vec<&'static str>) {
+pub fn value_and_grad_of(f: &FuncOp, funcs: &[FuncOp]) -> (FuncOp, Vec<&'static str>) {
     let mut b = Builder::new();
     let mut used: Vec<&'static str> = Vec::new();
 
@@ -49,11 +55,15 @@ pub fn value_and_grad_of(f: &FuncOp) -> (FuncOp, Vec<&'static str>) {
         }
         _ => panic!("value_and_grad: the function must return one value"),
     };
+    let body = body;
 
     // The adjoint of every value: the gradient that has accumulated so far.
     // The loss starts with one.
     let mut adj: HashMap<usize, Value> = HashMap::new();
-    let mut ops: Vec<Op> = body.clone();
+    // The calls of pure functions are inlined, so that the backward walk
+    // sees their operations.
+    let forward = expand_calls(body, funcs, 0);
+    let mut ops: Vec<Op> = forward.clone();
 
     let mut one = Op::new("arith.constant");
     one.attrs.push(("value".into(), Attr::Float(1.0)));
@@ -63,7 +73,7 @@ pub fn value_and_grad_of(f: &FuncOp) -> (FuncOp, Vec<&'static str>) {
     adj.insert(loss.id, seed);
 
     // The backward pass, from the loss back to the parameters.
-    for op in body.iter().rev() {
+    for op in forward.iter().rev() {
         let y = match op.results.first() {
             Some(r) => r.clone(),
             None => continue,
@@ -187,6 +197,87 @@ pub fn value_and_grad_of(f: &FuncOp) -> (FuncOp, Vec<&'static str>) {
                 ops.push(g);
                 accumulate(&mut ops, &mut b, &mut adj, &table, dtable);
             }
+            "mlr.layernorm" => {
+                // dx, dg and db; the statistics are recomputed from x.
+                used.push("mlr_layernorm_grad");
+                let x = op.operands[0].clone();
+                let g = op.operands[1].clone();
+                let bias = op.operands[2].clone();
+                let mut g_op = Op::new("mlr.layernorm_grad");
+                g_op.operands = vec![x.clone(), g.clone(), dy];
+                let dx = b.fresh_value(x.ty.clone());
+                let dg = b.fresh_value(g.ty.clone());
+                let db = b.fresh_value(bias.ty.clone());
+                g_op.results = vec![dx.clone(), dg.clone(), db.clone()];
+                ops.push(g_op);
+                accumulate(&mut ops, &mut b, &mut adj, &x, dx);
+                accumulate(&mut ops, &mut b, &mut adj, &g, dg);
+                accumulate(&mut ops, &mut b, &mut adj, &bias, db);
+            }
+            "mlr.transpose" => {
+                // The adjoint of the transpose is the transpose.
+                let x = op.operands[0].clone();
+                let mut t = Op::new("mlr.transpose");
+                t.operands = vec![dy];
+                let dx = b.fresh_value(x.ty.clone());
+                t.results = vec![dx.clone()];
+                ops.push(t);
+                accumulate(&mut ops, &mut b, &mut adj, &x, dx);
+            }
+            "mlr.softmax" | "mlr.softmax_tri" => {
+                // dx = y * (dy - sum(dy * y)) with y the output of the
+                // forward pass; the mask of the triangular version lives in
+                // the kernel.
+                used.push(if op.name == "mlr.softmax" {
+                    "mlr_softmax_grad"
+                } else {
+                    "mlr_softmax_tri_grad"
+                });
+                let x = op.operands[0].clone();
+                let name = if op.name == "mlr.softmax" {
+                    "mlr.softmax_grad"
+                } else {
+                    "mlr.softmax_tri_grad"
+                };
+                let mut g_op = Op::new(name);
+                g_op.operands = vec![y, dy];
+                let dx = b.fresh_value(x.ty.clone());
+                g_op.results = vec![dx.clone()];
+                ops.push(g_op);
+                accumulate(&mut ops, &mut b, &mut adj, &x, dx);
+            }
+            "mlr.add" => {
+                // Both operands receive the incoming gradient.
+                used.push("mlr_add_elem");
+                let lhs = op.operands[0].clone();
+                let rhs = op.operands[1].clone();
+                accumulate(&mut ops, &mut b, &mut adj, &lhs, dy.clone());
+                accumulate(&mut ops, &mut b, &mut adj, &rhs, dy);
+            }
+            "mlr.map" => {
+                // An element wise function of one tensor.
+                let x = op.operands[0].clone();
+                let dx = match elementwise_adjoint(op) {
+                    // A known non linear function: `map(t) |v| gelu(v)`.
+                    Some(grad) => {
+                        let mut g_op = Op::new(grad);
+                        g_op.operands = vec![x.clone(), dy];
+                        let dx = b.fresh_value(x.ty.clone());
+                        g_op.results = vec![dx.clone()];
+                        ops.push(g_op);
+                        used.push(match grad {
+                            "mlr.gelu_grad" => "mlr_gelu_grad",
+                            other => panic!("unknown gradient {other}"),
+                        });
+                        dx
+                    }
+                    // A linear map: `map(t) |v| v * 0.25`. The gradient of a
+                    // linear function is the same function of the incoming
+                    // gradient.
+                    None => linear_adjoint(&mut ops, &mut b, op, dy),
+                };
+                accumulate(&mut ops, &mut b, &mut adj, &x, dx);
+            }
             "mlr.cross_entropy" => {
                 // dlogits = (softmax(logits) - one hot(labels)) / rows.
                 used.push("mlr_cross_entropy_grad");
@@ -277,18 +368,252 @@ fn accumulate(
     adj.insert(target.id, new);
 }
 
+/// Replaces the calls of the pure functions of the program with their
+/// bodies: the values of the parameters become the values of the arguments
+/// and every value receives a fresh id. The calls of the runtime (their
+/// names start with `mlr_`) stay.
+fn expand_calls(ops: Vec<Op>, funcs: &[FuncOp], depth: usize) -> Vec<Op> {
+    if depth > 20 {
+        panic!("value_and_grad: the calls of the functions are too deep");
+    }
+    let mut out: Vec<Op> = Vec::new();
+    // The value that replaces a result of a call.
+    let mut redirect: HashMap<usize, Value> = HashMap::new();
+    let value_of = |v: &Value, redirect: &HashMap<usize, Value>| -> Value {
+        redirect.get(&v.id).cloned().unwrap_or_else(|| v.clone())
+    };
+    for op in ops {
+        if op.name == "func.call" {
+            let callee_name = match op.attr("callee") {
+                Some(Attr::Str(c)) => c.clone(),
+                _ => String::new(),
+            };
+            let is_runtime = callee_name.starts_with("mlr_");
+            if !is_runtime {
+                let callee = funcs
+                    .iter()
+                    .find(|f| f.name == callee_name)
+                    .unwrap_or_else(|| panic!("value_and_grad: unknown function `{}`", callee_name));
+                let mut body = callee.body.blocks[0].ops.clone();
+                let returns = match body.last() {
+                    Some(o) if o.name == "func.return" => {
+                        let v = o.operands.clone();
+                        body.pop();
+                        v
+                    }
+                    _ => panic!("value_and_grad: `{}` has no return", callee_name),
+                };
+                let expanded = expand_calls(body, funcs, depth + 1);
+                // The parameters of the callee are the arguments of the call.
+                let mut map: HashMap<usize, Value> = HashMap::new();
+                for (p, a) in callee.params.iter().zip(op.operands.iter()) {
+                    map.insert(p.id, value_of(a, &redirect));
+                }
+                let mut b = Builder::new();
+                for o in expanded {
+                    out.push(clone_op(&o, &mut map, &mut b));
+                }
+                // The first returned value stands for the result of the call.
+                if let (Some(r), Some(v)) = (op.results.first(), returns.first()) {
+                    let val = map.get(&v.id).cloned().unwrap_or_else(|| v.clone());
+                    redirect.insert(r.id, val);
+                }
+                continue;
+            }
+        }
+        let mut o2 = op.clone();
+        remap_values(&mut o2, &redirect);
+        out.push(o2);
+    }
+    out
+}
+
+/// Replaces the operands of an operation (and of the operations of its
+/// regions) with the values of the redirect.
+fn remap_values(op: &mut Op, redirect: &HashMap<usize, Value>) {
+    for o in &mut op.operands {
+        if let Some(v) = redirect.get(&o.id) {
+            *o = v.clone();
+        }
+    }
+    for region in &mut op.regions {
+        for block in &mut region.blocks {
+            for o in &mut block.ops {
+                remap_values(o, redirect);
+            }
+        }
+    }
+}
+
+/// A deep copy of an operation: every value receives a fresh id, and the
+/// references to the values of the map are replaced.
+fn clone_op(op: &Op, map: &mut HashMap<usize, Value>, b: &mut Builder) -> Op {
+    let mut new = Op::new(op.name.as_str());
+    new.generic = op.generic;
+    new.attrs = op.attrs.clone();
+    new.loc = op.loc.clone();
+    for o in &op.operands {
+        let v = map.get(&o.id).cloned().unwrap_or_else(|| o.clone());
+        new.operands.push(v);
+    }
+    for r in &op.results {
+        let nv = b.fresh_value(r.ty.clone());
+        map.insert(r.id, nv.clone());
+        new.results.push(nv);
+    }
+    for region in &op.regions {
+        let mut nr = crate::ir::Region::default();
+        for block in &region.blocks {
+            let mut args = Vec::new();
+            for a in &block.args {
+                let nv = b.fresh_value(a.ty.clone());
+                map.insert(a.id, nv.clone());
+                args.push(nv);
+            }
+            let mut nops = Vec::new();
+            for o in &block.ops {
+                nops.push(clone_op(o, map, b));
+            }
+            nr.blocks.push(crate::ir::Block { args, ops: nops });
+        }
+        new.regions.push(nr);
+    }
+    new
+}
+
+/// The gradient of a linear `map`: the body computes one arithmetic
+/// operation of the argument and a constant, and the gradient applies the
+/// scaling of the derivative to the incoming gradient.
+fn linear_adjoint(ops: &mut Vec<Op>, b: &mut Builder, op: &Op, dy: Value) -> Value {
+    // The operation of the body, and the constant on either side of it.
+    let scale = linear_scale(op).expect("a known linear map");
+    map_scale(ops, b, dy, scale)
+}
+
+/// The factor of the derivative of a linear `map`, if its body is one
+/// arithmetic operation of the argument and a constant.
+fn linear_scale(op: &Op) -> Option<f64> {
+    let block = op.regions.first()?.blocks.first()?;
+    if block.args.len() != 1 {
+        return None;
+    }
+    let arith = block
+        .ops
+        .iter()
+        .find(|o| {
+            matches!(
+                o.name.as_str(),
+                "arith.mulf" | "arith.addf" | "arith.subf" | "arith.divf"
+            )
+        })?;
+    let const_op = block.ops.iter().find(|o| o.name == "arith.constant")?;
+    let c = match const_op.attr("value") {
+        Some(Attr::Float(v)) => *v,
+        Some(Attr::Int(v)) => *v as f64,
+        _ => return None,
+    };
+    let is_left = arith
+        .operands
+        .first()
+        .map(|v| v.id == block.args[0].id)
+        .unwrap_or(false);
+    match (arith.name.as_str(), is_left) {
+        ("arith.mulf", _) => Some(c),
+        ("arith.addf", _) => Some(1.0),
+        ("arith.subf", true) => Some(1.0),
+        ("arith.subf", false) => Some(-1.0),
+        ("arith.divf", true) => Some(1.0 / c),
+        _ => None,
+    }
+}
+
+/// A `map` that multiplies its input by a constant.
+fn map_scale(ops: &mut Vec<Op>, b: &mut Builder, input: Value, scale: f64) -> Value {
+    let mut m = Op::new("mlr.map");
+    m.generic = true;
+    m.operands = vec![input.clone()];
+    let arg = b.fresh_value(Type::Scalar(crate::ir::ScalarKind::F32));
+    let mut cst = Op::new("arith.constant");
+    cst.attrs.push(("value".into(), Attr::Float(scale)));
+    let cv = b.fresh_value(Type::Scalar(crate::ir::ScalarKind::F32));
+    cst.results.push(cv.clone());
+    let mut mul = Op::new("arith.mulf");
+    mul.operands = vec![arg.clone(), cv];
+    let r = b.fresh_value(Type::Scalar(crate::ir::ScalarKind::F32));
+    mul.results.push(r.clone());
+    let mut y = Op::new("mlr.yield");
+    y.operands = vec![r];
+    m.regions.push(crate::ir::Region {
+        blocks: vec![crate::ir::Block {
+            args: vec![arg],
+            ops: vec![cst, mul, y],
+        }],
+    });
+    let res = b.fresh_value(input.ty.clone());
+    m.results.push(res.clone());
+    ops.push(m);
+    res
+}
+
+/// The name of the gradient operation of an element wise `map`, when the
+/// body is one call of a known function of the argument.
+fn elementwise_adjoint(op: &Op) -> Option<&'static str> {
+    if op.operands.len() != 1 {
+        return None;
+    }
+    let region = op.regions.first()?;
+    let block = region.blocks.first()?;
+    if block.args.len() != 1 || block.ops.len() != 2 {
+        return None;
+    }
+    let call = &block.ops[0];
+    let yield_op = &block.ops[1];
+    if call.name != "func.call" || yield_op.name != "mlr.yield" {
+        return None;
+    }
+    if call.operands.len() != 1 || call.operands[0].id != block.args[0].id {
+        return None;
+    }
+    match call.attr("callee") {
+        Some(Attr::Str(c)) if c == "mlr_gelu" => Some("mlr.gelu_grad"),
+        _ => None,
+    }
+}
+
 /// Verifies that a function can be differentiated.
-pub fn check_differentiable(f: &FuncOp) -> Result<(), String> {
+pub fn check_differentiable(f: &FuncOp, funcs: &[FuncOp]) -> Result<(), String> {
     for op in &f.body.blocks[0].ops {
+        if op.name == "func.call" {
+            if let Some(Attr::Str(callee)) = op.attr("callee") {
+                if !callee.starts_with("mlr_") {
+                    let callee_fn = funcs
+                        .iter()
+                        .find(|g| g.name == *callee)
+                        .ok_or_else(|| format!("unknown function `{}`", callee))?;
+                    check_differentiable(callee_fn, funcs)?;
+                    continue;
+                }
+            }
+        }
         if !FORWARD.contains(&op.name.as_str()) {
             return Err(format!(
                 "the operation `{}` has no gradient yet",
                 op.name
             ));
         }
+        if op.name == "mlr.map" {
+            if elementwise_adjoint(op).is_none() && linear_scale(op).is_none() {
+                return Err(
+                    "the gradient of this `map` is not known; only \
+                     `map(t) |v| { yield gelu(v) }` can be differentiated"
+                        .to_string(),
+                );
+            }
+            continue;
+        }
         if !op.regions.is_empty() {
             return Err(
-                "the function has a region (`map`, `for` or `if`), which cannot \
+                "the function has a region (`for` or `if`), which cannot \
                  be differentiated yet"
                     .to_string(),
             );

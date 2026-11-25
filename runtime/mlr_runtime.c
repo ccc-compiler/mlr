@@ -888,3 +888,123 @@ void mlr_embed_seq_grad(const void *ids, const void *dy, void *dtable, int64_t r
         }
     }
 }
+
+/* The gradient of the layer normalization. The statistics are recomputed
+ * from the input:
+ *
+ *   dx = (g / s) * (dy - mean(dy) - xhat * mean(dy * xhat))
+ *   dg = the sum over the rows of dy * xhat
+ *   db = the sum over the rows of dy */
+void mlr_layernorm_grad(const void *x, const void *gamma, const void *dy, void *dx, void *dg,
+                        void *db, int64_t rows, int64_t width) {
+    const float *X = (const float *)x;
+    const float *G = (const float *)gamma;
+    const float *DY = (const float *)dy;
+    float *DX = (float *)dx;
+    float *DG = (float *)dg;
+    float *DB = (float *)db;
+    for (int64_t i = 0; i < width; i++) {
+        DG[i] = 0.0f;
+        DB[i] = 0.0f;
+    }
+    for (int64_t r = 0; r < rows; r++) {
+        const float *row = X + r * width;
+        const float *drow = DY + r * width;
+        float *dout = DX + r * width;
+        double mean = 0.0;
+        for (int64_t i = 0; i < width; i++) mean += row[i];
+        mean /= (double)width;
+        double var = 0.0;
+        for (int64_t i = 0; i < width; i++) {
+            double d = row[i] - mean;
+            var += d * d;
+        }
+        var /= (double)width;
+        float inv = 1.0f / sqrtf((float)(var + 1e-5));
+        double sum_dy = 0.0;
+        double sum_dy_xhat = 0.0;
+        for (int64_t i = 0; i < width; i++) {
+            float xhat = (float)(((double)row[i] - mean) * (double)inv);
+            // The means are of the gradient scaled by the gamma.
+            sum_dy += (double)G[i] * drow[i];
+            sum_dy_xhat += (double)G[i] * drow[i] * xhat;
+            DG[i] += drow[i] * xhat;
+            DB[i] += drow[i];
+        }
+        float a = (float)(sum_dy / (double)width);
+        float b = (float)(sum_dy_xhat / (double)width);
+        for (int64_t i = 0; i < width; i++) {
+            float xhat = (float)(((double)row[i] - mean) * (double)inv);
+            dout[i] = inv * (G[i] * drow[i] - a - xhat * b);
+        }
+    }
+}
+
+/* The gradient of the softmax of the rows: y is the output of the forward
+ * pass and dx = y * (dy - sum(dy * y)) for every row. */
+void mlr_softmax_grad(const void *y, const void *dy, void *dx, int64_t rows, int64_t cols) {
+    const float *Y = (const float *)y;
+    const float *DY = (const float *)dy;
+    float *DX = (float *)dx;
+    for (int64_t r = 0; r < rows; r++) {
+        const float *yrow = Y + r * cols;
+        const float *drow = DY + r * cols;
+        float *out = DX + r * cols;
+        double dot = 0.0;
+        for (int64_t j = 0; j < cols; j++) {
+            dot += (double)drow[j] * yrow[j];
+        }
+        for (int64_t j = 0; j < cols; j++) {
+            out[j] = yrow[j] * (drow[j] - (float)dot);
+        }
+    }
+}
+
+/* The softmax of the rows of the scores with a causal (triangular) mask:
+ * the column j of the row r only participates when j <= r. This is the
+ * attention of a decoder; the mask lives in the kernel, so that the program
+ * has no loops for it. */
+void mlr_softmax_tri(const void *scores, void *out, int64_t size) {
+    const float *S = (const float *)scores;
+    float *Y = (float *)out;
+    for (int64_t r = 0; r < size; r++) {
+        const float *row = S + r * size;
+        float *dst = Y + r * size;
+        float best = -3.402823466e+38f;
+        for (int64_t j = 0; j <= r; j++) {
+            if (row[j] > best) best = row[j];
+        }
+        double sum = 0.0;
+        for (int64_t j = 0; j <= r; j++) {
+            float e = expf(row[j] - best);
+            dst[j] = e;
+            sum += e;
+        }
+        for (int64_t j = 0; j <= r; j++) {
+            dst[j] = (float)(dst[j] / sum);
+        }
+        for (int64_t j = r + 1; j < size; j++) {
+            dst[j] = 0.0f;
+        }
+    }
+}
+
+/* The gradient of the masked softmax: y is the output of the forward pass;
+ * the columns beyond the diagonal receive no gradient. */
+void mlr_softmax_tri_grad(const void *y, const void *dy, void *dx, int64_t size) {
+    const float *Y = (const float *)y;
+    const float *DY = (const float *)dy;
+    float *DX = (float *)dx;
+    for (int64_t r = 0; r < size; r++) {
+        const float *yrow = Y + r * size;
+        const float *drow = DY + r * size;
+        float *out = DX + r * size;
+        double dot = 0.0;
+        for (int64_t j = 0; j <= r; j++) {
+            dot += (double)drow[j] * yrow[j];
+        }
+        for (int64_t j = 0; j < size; j++) {
+            out[j] = j <= r ? yrow[j] * (drow[j] - (float)dot) : 0.0f;
+        }
+    }
+}

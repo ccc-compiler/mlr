@@ -1,6 +1,6 @@
 # 設計提案：MLR 的訓練（反向傳遞）
 
-> 狀態：**M1 與 M2 已實作**（v0.2）。與本文件的差異：`value_and_grad` 的多值
+> 狀態：**M1–M3 已實作**（v0.2）。與本文件的差異：`value_and_grad` 的多值
 > 回傳用匿名的 struct 打包（`let (a, b) = ...` 解包）；梯度函式在
 > build 階段（stage 1 之後）產生，不是 stage 3.5 的 pass；廣播
 > （`w - 0.01 * dw`）與 `let` 解包是隨訓練一起加入的語言功能。
@@ -33,7 +33,7 @@
 | 里程碑 | 內容 |
 | ------ | ---- |
 | M2 | `conv2d`、`maxpool2d`、`embed`/`embed_seq` 的梯度（CNN 與語言模型的訓練）。**已實作**，另含 `sum`、`flatten` 的梯度——`examples/train/train_cnn.mlr` 在 MLR 內把 MNIST CNN 訓練到 100/100 |
-| M3 | `layernorm`、`gelu`、`transpose`、`softmax` 的梯度 → GPT 微調；Adam（狀態用 iter 攜帶）；MPS 梯度核心 |
+| M3 | `layernorm`、`gelu`、`transpose`、`softmax` 的梯度 → GPT 微調；Adam（狀態用 iter 攜帶）；MPS 梯度核心。**已實作**：`examples/train/train_gpt.mlr` 在 MLR 內微調 GPT 的語言模型頭（loss 5.5 → 0.014）；`examples/train/train_adam.mlr` 用語言本身寫的 Adam 訓練 softmax 回歸（2.29 → 0.002）。梯度核心由 CPU/MPS 共用的 C runtime 提供（matmul 的 MPS 版只加速前向，反向走同一批 C 函式） |
 
 ### 明確不做
 
@@ -183,6 +183,10 @@ stage 5  runtime calls
 | `layernorm(x, g, b)` | 見 M3 | 標準公式，需要保留 mean 與 rstd |
 | `conv2d` / `maxpool2d` / `embed*` | **已實作** | conv：`mlr_conv2d_grad` 直接算相關性（scatter 形式）；pool：反向重算 argmax（與前向同一個 tie breaking）；embed：零表 + scatter-add（單執行緒） |
 | `sum(t)` / `flatten(x)` | **已實作** | sum 的反向把梯度填滿每個元素；flatten 的反向是重排（拷貝），使 CNN 的訓練得以串接 |
+| `layernorm` / `transpose` / `softmax` / `softmax_tri` | **已實作（M3）** | layernorm 的反向重算 μ/σ（公式：`dx = (g∘dy − mean(g∘dy) − x̂·mean(g∘dy∘x̂))/σ`）；transpose 的反向就是 transpose；softmax 的反向 `y·(dy−⟨dy,y⟩)` 用前向輸出 |
+| `softmax_tri(x)`（新 op） | **已實作（M3）** | 因果遮罩的 softmax（解碼器注意力），遮罩在 kernel 裡——GPT 的訓練因此不需要 `for` 迴圈建 mask |
+| 元素級 `map` | **已實作（M3）** | 兩種模式：`map(t) \|v\| gelu(v)`（非線性，kernel 梯度）與線性 body（`v * c`、`v + c`、`c − v`、`v / c`——廣播運算的形狀，反向是同樣的線性映射） |
+| 函式呼叫 | **已實作（M3）** | 被微分函式裡對純前向函式的呼叫會被內聯（參數代換、值重編號），loss 可以拆成輔助函式 |
 
 ### 4.4 控制流程限制（M1）
 
@@ -236,5 +240,12 @@ tensor 值，bufferize 照常配置；小模型的記憶體完全沒問題。之
 * `conv2d`/`maxpool2d`/`embed*` 的梯度（M2）。
 * Adam、learning rate schedule、梯度裁剪（M3；裁剪是純元素級運算，語言可直接寫）。
 * 資料 shuffle、mini-batch 的隨機取樣。
-* MPS 梯度核心（反向的 GEMM 其實就是 `MPSMatrixMultiplication` 的不同形狀，成本低）。
 * 線性控制流的 AD（`for` 的反向 = 反向 `for` + 累積）。
+
+### 已知問題
+
+* **純量 loop-carried 值與 struct `with` 混用**：`for` 同時攜帶 struct 與
+  純量、body 用 `with` 更新 struct 時，數值會壞（NaN）。訓練範例把狀態全
+  放進 struct（或全用獨立 iter）即可繞過；根因在 build/bufferize 的
+  leaf 對映，待修。
+* Adam 的 bias correction 用常數近似（1−βᵗ ≈ 1），只影響最初幾步。
