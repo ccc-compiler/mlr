@@ -163,7 +163,9 @@ let total = for i in 0..n step 1 iter(acc = 0) {
 * `iter(name = initial)` declares the loop-carried values; the body must yield
   exactly one value per declaration.
 * `step` is optional and defaults to `1`.
-* The value of the expression is the final value of the loop-carried values.
+* The value of the expression is the final value of the first loop-carried
+  value; `let (a, b) = for ... iter(a = .., b = ..)` unpacks into **all** of
+  them.
 
 ### Tensor operations
 

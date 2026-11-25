@@ -5,6 +5,10 @@ edition = "2021"
 description = "MLR: a high-level language whose semantics are isomorphic to MLIR's IR model"
 license = "MIT"
 
+[lib]
+name = "mlr"
+path = "src/lib.rs"
+
 [[bin]]
 name = "mlr"
 path = "src/main.rs"

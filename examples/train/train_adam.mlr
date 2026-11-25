@@ -1,68 +1,52 @@
 // Adam in MLR: a softmax regression (784 -> 10) on the hundred MNIST
 // images, trained with the Adam update, written in the language itself.
 //
-// Every parameter carries its first and second moment in the loop. The
-// bias correction of the first steps is omitted (the moments are divided by
-// their fixed factors), which changes the size of the first few steps only.
+// Every parameter carries its first and second moment in the loop; the loop
+// unpacks into all of its loop-carried values (`let (w, mw, ...) = for
+// ...`), so no struct is needed. The bias corrections are the powers c1 =
+// 0.9^t and c2 = 0.999^t, accumulated as products.
 
 fn loss(w: Tensor<784x10xf32>, b: Tensor<10xf32>, x: Tensor<100x784xf32>, y: Tensor<100xi32>) -> f32 {
     yield cross_entropy(add_bias(matmul(x, w), b), y)
 }
 
-// The state of the optimizer: the parameters, their moments and the
-// accumulated bias corrections.
-struct Adam {
-    w: Tensor<784x10xf32>,
-    b: Tensor<10xf32>,
-    mw: Tensor<784x10xf32>,
-    vw: Tensor<784x10xf32>,
-    mb: Tensor<10xf32>,
-    vb: Tensor<10xf32>
-}
-
 fn main() {
     let x = mlr.load<Tensor<100x784xf32>>("examples/train/images.bin")
     let y = mlr.load<Tensor<100xi32>>("examples/train/labels.bin")
-    // Small random weights.
-    let start = Adam {
-        w: mlr.load<Tensor<784x10xf32>>("examples/train/aw.bin"),
-        b: mlr.load<Tensor<10xf32>>("examples/train/ab.bin"),
-        mw: tensor.zeros<Tensor<784x10xf32>>(),
-        vw: tensor.zeros<Tensor<784x10xf32>>(),
-        mb: tensor.zeros<Tensor<10xf32>>(),
-        vb: tensor.zeros<Tensor<10xf32>>()
-    }
 
-    let trained = for step in 0..200 step 1 iter(state = start) {
-        let w0 = state.w
-        let b0 = state.b
-        let mw0 = state.mw
-        let vw0 = state.vw
-        let mb0 = state.mb
-        let vb0 = state.vb
-        let (l, dw, db, _, _) = value_and_grad(loss, w0, b0, x, y)
+    let (w, b, mw, vw, mb, vb, n1, n2) = for step in 0..200 step 1 iter(
+        w = mlr.load<Tensor<784x10xf32>>("examples/train/aw.bin"),
+        b = mlr.load<Tensor<10xf32>>("examples/train/ab.bin"),
+        mw = tensor.zeros<Tensor<784x10xf32>>(),
+        vw = tensor.zeros<Tensor<784x10xf32>>(),
+        mb = tensor.zeros<Tensor<10xf32>>(),
+        vb = tensor.zeros<Tensor<10xf32>>(),
+        c1 = 1.0,
+        c2 = 1.0
+    ) {
+        let (l, dw, db, _, _) = value_and_grad(loss, w, b, x, y)
         if step % 40 == 0 {
             print(l)
         }
         // The moments.
-        let mw = map(mw0, dw) |m, g| { yield 0.9 * m + 0.1 * g }
-        let vw = map(vw0, dw) |v, g| { yield 0.999 * v + 0.001 * (g * g) }
-        let mb = map(mb0, db) |m, g| { yield 0.9 * m + 0.1 * g }
-        let vb = map(vb0, db) |v, g| { yield 0.999 * v + 0.001 * (g * g) }
-        // The bias corrections: c1 = 0.9^t, c2 = 0.999^t, updated before
-        // the step, so that the first correction is the one of t = 1.
-        let n1 = 0.1
-        let n2 = 0.001
+        let mw = map(mw, dw) |m, g| { yield 0.9 * m + 0.1 * g }
+        let vw = map(vw, dw) |v, g| { yield 0.999 * v + 0.001 * (g * g) }
+        let mb = map(mb, db) |m, g| { yield 0.9 * m + 0.1 * g }
+        let vb = map(vb, db) |v, g| { yield 0.999 * v + 0.001 * (g * g) }
+        // The bias corrections: c1 = 0.9^t, c2 = 0.999^t, updated before the
+        // step, so that the first correction is the one of t = 1.
+        let n1 = c1 * 0.9
+        let n2 = c2 * 0.999
         // The update.
         let mh = map(mw) |m| { yield m / (1.0 - n1) }
         let vh = map(vw) |v| { yield v / (1.0 - n2) }
         let step_w = map(mh, vh) |m, v| { yield m / (sqrt(v) + 0.00000001) }
-        let w1 = map(w0, step_w) |a, s| { yield a - 0.002 * s }
+        let w = map(w, step_w) |a, s| { yield a - 0.002 * s }
         let mh2 = map(mb) |m| { yield m / (1.0 - n1) }
         let vh2 = map(vb) |v| { yield v / (1.0 - n2) }
         let step_b = map(mh2, vh2) |m, v| { yield m / (sqrt(v) + 0.00000001) }
-        let b1 = map(b0, step_b) |a, s| { yield a - 0.002 * s }
-        yield state with { w: w1, b: b1, mw: mw, vw: vw, mb: mb, vb: vb }
+        let b = map(b, step_b) |a, s| { yield a - 0.002 * s }
+        yield w, b, mw, vw, mb, vb, n1, n2
     }
-    print(tensor.extract(trained.w, [0, 0]))
+    print(tensor.extract(w, [0, 0]))
 }

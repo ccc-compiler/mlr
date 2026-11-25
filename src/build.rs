@@ -352,8 +352,24 @@ impl IrBuilder {
                 }
                 TStmt::LetMulti { names, value, span, .. } => {
                     self.cur_loc = Loc::new(&self.file, span.line, span.col);
-                    let v = self.expr(value);
-                    let leaves = self.leaves(&v);
+                    // A `for` unpacks into all of its loop-carried values;
+                    // every other value unpacks into the fields of its
+                    // struct.
+                    let leaves = match value {
+                        TExpr::For {
+                            var,
+                            lb,
+                            ub,
+                            step,
+                            iter,
+                            body,
+                            ..
+                        } => self.build_for_all(var, lb, ub, step, iter, body),
+                        value => {
+                            let v = self.expr(value);
+                            self.leaves(&v)
+                        }
+                    };
                     for (name, leaf) in names.iter().zip(leaves.iter()) {
                         if name != "_" {
                             self.define(name, leaf.clone());
@@ -1136,6 +1152,23 @@ impl IrBuilder {
         res
     }
 
+    /// Builds the loop and returns ALL of its loop-carried values (the
+    /// leaves of every iter binding, in order).
+    fn build_for_all(
+        &mut self,
+        var: &str,
+        lb: &TExpr,
+        ub: &TExpr,
+        step: &TExpr,
+        iter: &[crate::check::TIter],
+        body: &TBlock,
+    ) -> Vec<Value> {
+        self.build_for_inner(var, lb, ub, step, iter, body)
+            .into_iter()
+            .flat_map(|(values, _)| values)
+            .collect()
+    }
+
     fn build_for(
         &mut self,
         var: &str,
@@ -1145,6 +1178,24 @@ impl IrBuilder {
         iter: &[crate::check::TIter],
         body: &TBlock,
     ) -> Value {
+        // The value of the loop is the first loop-carried value, bundled
+        // (a struct stays a struct).
+        let leaves = self.build_for_inner(var, lb, ub, step, iter, body);
+        if let Some(((values, _), it)) = leaves.first().zip(iter.first()) {
+            return self.bundle(values.clone(), &it.ty);
+        }
+        self.fresh(Type::Void)
+    }
+
+    fn build_for_inner(
+        &mut self,
+        var: &str,
+        lb: &TExpr,
+        ub: &TExpr,
+        step: &TExpr,
+        iter: &[crate::check::TIter],
+        body: &TBlock,
+    ) -> Vec<(Vec<Value>, Vec<Type>)> {
         let lb_v = self.expr(lb);
         let lb = self.coerce_to(lb_v, &CType::Index);
         let ub_v = self.expr(ub);
@@ -1203,12 +1254,14 @@ impl IrBuilder {
             }],
         });
         self.emit(o);
-        // The value of the loop is the first loop-carried value.
-        if let Some((it, leaves)) = iter.first().zip(result_leaves.first()) {
-            self.bundle(leaves.clone(), &it.ty)
-        } else {
-            self.fresh(Type::Void)
-        }
+        // The leaves of every loop-carried value, with their types.
+        iter.iter()
+            .zip(result_leaves.iter())
+            .map(|(_it, leaves)| {
+                let types = leaves.iter().map(|l| l.ty.clone()).collect();
+                (leaves.clone(), types)
+            })
+            .collect()
     }
 
     fn build_map(

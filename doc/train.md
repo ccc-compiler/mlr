@@ -244,8 +244,9 @@ tensor 值，bufferize 照常配置；小模型的記憶體完全沒問題。之
 
 ### 已知問題
 
-* **純量 loop-carried 值與 struct `with` 混用**：`for` 同時攜帶 struct 與
-  純量、body 用 `with` 更新 struct 時，數值會壞（NaN）。訓練範例把狀態全
-  放進 struct（或全用獨立 iter）即可繞過；根因在 build/bufferize 的
-  leaf 對映，待修。
-* Adam 的 bias correction 用常數近似（1−βᵗ ≈ 1），只影響最初幾步。
+* **（已修）純量 loop-carried 值與 struct `with` 混用**：`train_adam` 曾
+  出現 NaN——根因是 `linalg` 的 in-place 重用寫進了常數衍生的 buffer
+  （`mlr.load` 的 global 經由 iter arg 傳入）。修復：bufferize 排除
+  參數與常數衍生的 in-place；回歸測試
+  `carries_a_struct_and_a_scalar_in_one_loop`。Adam 的真 bias
+  correction（純量 iter）已恢復。

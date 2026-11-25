@@ -10,6 +10,7 @@
 //! `reduce`) becomes an operation with a region, so lowering is a structural
 //! mapping instead of a guess about the original intent.
 
+use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -591,11 +592,51 @@ fn renumber_uses_region(region: &mut Region, map: &std::collections::HashMap<usi
 /// somewhere in the enclosing function.
 pub fn verify(module: &Module) -> Result<(), String> {
     for f in &module.funcs {
+        // The types of the values of THIS function: the ids are per function
+        // after the renumbering, so the map must not be shared.
+        let mut types: HashMap<usize, Type> = HashMap::new();
         let mut defined = std::collections::HashSet::new();
         for p in &f.params {
             defined.insert(p.id);
+            types.insert(p.id, p.ty.clone());
         }
-        verify_region(&f.body, &mut defined, &f.name)?;
+        // The declarations of the runtime: the calls are checked against
+        // them.
+        let mut decls: HashMap<&str, (Vec<Type>, Vec<Type>)> = HashMap::new();
+        for d in &module.decls {
+            decls.insert(d.name.as_str(), (d.params.clone(), d.results.clone()));
+        }
+        verify_region(&f.body, &mut defined, &mut types, &decls, &f.name)?;
+        // The result of the function must match its signature.
+        verify_return(&f)?;
+    }
+    Ok(())
+}
+
+fn verify_return(f: &FuncOp) -> Result<(), String> {
+    let term = match f.body.blocks[0].ops.last() {
+        Some(t) if t.name == "func.return" => t,
+        _ => return Ok(()),
+    };
+    let types: Vec<Type> = term.operands.iter().map(|o| o.ty.clone()).collect();
+    if types.len() != f.results.len() {
+        return Err(format!(
+            "function `{}` returns {} value(s) but its signature has {}",
+            f.name,
+            types.len(),
+            f.results.len()
+        ));
+    }
+    for (i, (a, b)) in types.iter().zip(f.results.iter()).enumerate() {
+        if a != b {
+            return Err(format!(
+                "function `{}`: the {}-th returned value has type {}, expected {}",
+                f.name,
+                i,
+                a.name(),
+                b.name()
+            ));
+        }
     }
     Ok(())
 }
@@ -603,6 +644,8 @@ pub fn verify(module: &Module) -> Result<(), String> {
 fn verify_region(
     region: &Region,
     defined: &mut std::collections::HashSet<usize>,
+    types: &mut HashMap<usize, Type>,
+    decls: &HashMap<&str, (Vec<Type>, Vec<Type>)>,
     func: &str,
 ) -> Result<(), String> {
     if region.blocks.is_empty() {
@@ -611,6 +654,7 @@ fn verify_region(
     for block in &region.blocks {
         for a in &block.args {
             defined.insert(a.id);
+            types.insert(a.id, a.ty.clone());
         }
         for (i, op) in block.ops.iter().enumerate() {
             for o in &op.operands {
@@ -619,6 +663,71 @@ fn verify_region(
                         "function `{}`: operand %{} of `{}` is not defined before use",
                         func, o.id, op.name
                     ));
+                }
+                // The type of every use must match the type of the value.
+                if let Some(t) = types.get(&o.id) {
+                    if *t != o.ty {
+                        return Err(format!(
+                            "function `{}`: operand %{} of `{}` has type {}, but the \
+                             value has type {}",
+                            func,
+                            o.id,
+                            op.name,
+                            o.ty.name(),
+                            t.name()
+                        ));
+                    }
+                }
+            }
+            // A call must match the signature of its callee.
+            if op.name == "func.call" {
+                if let Some(Attr::Str(callee)) = op.attr("callee") {
+                    if let Some((params, results)) = decls.get(callee.as_str()) {
+                        if op.operands.len() != params.len() {
+                            return Err(format!(
+                                "function `{}`: the call of `{}` has {} operand(s), \
+                                 the declaration has {}",
+                                func,
+                                callee,
+                                op.operands.len(),
+                                params.len()
+                            ));
+                        }
+                        for (o, p) in op.operands.iter().zip(params.iter()) {
+                            if o.ty != *p {
+                                return Err(format!(
+                                    "function `{}`: the operand of the call of `{}` has \
+                                     type {}, expected {}",
+                                    func,
+                                    callee,
+                                    o.ty.name(),
+                                    p.name()
+                                ));
+                            }
+                        }
+                        if op.results.len() != results.len() {
+                            return Err(format!(
+                                "function `{}`: the call of `{}` returns {} value(s), \
+                                 the declaration has {}",
+                                func,
+                                callee,
+                                op.results.len(),
+                                results.len()
+                            ));
+                        }
+                        for (r, p) in op.results.iter().zip(results.iter()) {
+                            if r.ty != *p {
+                                return Err(format!(
+                                    "function `{}`: the result of the call of `{}` has \
+                                     type {}, expected {}",
+                                    func,
+                                    callee,
+                                    r.ty.name(),
+                                    p.name()
+                                ));
+                            }
+                        }
+                    }
                 }
             }
             for r in &op.results {
@@ -630,7 +739,7 @@ fn verify_region(
                 }
             }
             for r in &op.regions {
-                verify_region(r, defined, func)?;
+                verify_region(r, defined, types, decls, func)?;
             }
             let last = i + 1 == block.ops.len();
             if last && !op.is_terminator() {

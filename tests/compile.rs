@@ -591,6 +591,89 @@ impl S {
 }
 
 #[test]
+fn unpacks_the_loop_carried_values() {
+    // `let (a, b) = for ...` unpacks into all of the loop-carried values.
+    let Some(out) = run(
+        r#"
+fn main() {
+    let (a, b) = for step in 0..3 step 1 iter(x = 1.0, y = 10) {
+        yield x + 1.0, y + 1
+    }
+    print(a)
+    print(b)
+}
+"#,
+    ) else {
+        eprintln!("skipping: the LLVM tool chain is not available");
+        return;
+    };
+    assert_eq!(out.lines().collect::<Vec<_>>(), vec!["4.000000", "13"]);
+}
+
+#[test]
+fn carries_a_struct_and_a_scalar_in_one_loop() {
+    // The regression of the NaN bug: a struct and a scalar carried by the
+    // same loop, the struct updated with a `with`.
+    let Some(out) = run(
+        r#"
+struct St {
+    w: Tensor<2x2xf32>,
+    m: Tensor<2x2xf32>
+}
+
+fn main() {
+    let w0 = tensor.zeros<Tensor<2x2xf32>>()
+    let start = St { w: w0, m: w0 }
+    let trained = for step in 0..3 step 1 iter(state = start, c = 1.0) {
+        let w1 = map(state.w) |a| {
+            yield a - 0.1 * c
+        }
+        yield state with { w: w1 }, c * 0.5
+    }
+    print(tensor.extract(trained.w, [0, 0]))
+}
+"#,
+    ) else {
+        eprintln!("skipping: the LLVM tool chain is not available");
+        return;
+    };
+    // 0.0 - 0.1*1 - 0.1*0.5 - 0.1*0.25 = -0.175
+    assert_eq!(out.trim(), "-0.175000", "{}", out);
+}
+
+#[test]
+fn carries_tensor_insert_state_in_a_loop() {
+    let Some(out) = run(
+        r#"
+struct St {
+    w: Tensor<2x2xf32>,
+    c: Tensor<1xf32>
+}
+
+fn main() {
+    let start = St {
+        w: tensor.zeros<Tensor<2x2xf32>>(),
+        c: tensor.insert(tensor.zeros<Tensor<1xf32>>(), [0], 0.1)
+    }
+    let trained = for step in 0..3 step 1 iter(state = start) {
+        let c1 = tensor.insert(state.c, [0], tensor.extract(state.c, [0]) * 0.9)
+        print(tensor.extract(c1, [0]))
+        yield state with { c: c1 }
+    }
+}
+"#,
+    ) else {
+        eprintln!("skipping: the LLVM tool chain is not available");
+        return;
+    };
+    // 0.1 * 0.9^t
+    assert_eq!(
+        out.lines().collect::<Vec<_>>(),
+        vec!["0.090000", "0.081000", "0.072900"]
+    );
+}
+
+#[test]
 fn uses_the_scalar_math_of_the_library() {
     let mlir = compile(
         r#"

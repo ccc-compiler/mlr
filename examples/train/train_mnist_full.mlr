@@ -30,29 +30,21 @@ fn predict(
     yield argmax(add_bias(matmul(h, w2), b2))
 }
 
-// The weights of the network, bundled for the training loop.
-struct Net {
-    w1: Tensor<784x32xf32>,
-    b1: Tensor<32xf32>,
-    w2: Tensor<32x10xf32>,
-    b2: Tensor<10xf32>
-}
-
 fn main() {
     let images = mlr.load<Tensor<100x784xf32>>("examples/train/images.bin")
     let labels = mlr.load<Tensor<100xi32>>("examples/train/labels.bin")
-    let w1 = mlr.load<Tensor<784x32xf32>>("examples/train/aw1.bin")
-    let b1 = mlr.load<Tensor<32xf32>>("examples/train/ab1.bin")
-    let w2 = mlr.load<Tensor<32x10xf32>>("examples/train/aw2.bin")
-    let b2 = mlr.load<Tensor<10xf32>>("examples/train/ab2.bin")
+    let w1_0 = mlr.load<Tensor<784x32xf32>>("examples/train/aw1.bin")
+    let b1_0 = mlr.load<Tensor<32xf32>>("examples/train/ab1.bin")
+    let w2_0 = mlr.load<Tensor<32x10xf32>>("examples/train/aw2.bin")
+    let b2_0 = mlr.load<Tensor<10xf32>>("examples/train/ab2.bin")
 
-    let start = Net { w1: w1, b1: b1, w2: w2, b2: b2 }
-
-    let trained = for step in 0..200 step 1 iter(state = start) {
-        let w1 = state.w1
-        let b1 = state.b1
-        let w2 = state.w2
-        let b2 = state.b2
+    // The loop unpacks into all of its loop-carried values.
+    let (w1, b1, w2, b2) = for step in 0..200 step 1 iter(
+        w1 = w1_0,
+        b1 = b1_0,
+        w2 = w2_0,
+        b2 = b2_0
+    ) {
         // The batch: ten images, drawn by a fresh permutation.
         let perm = rand_permutation(100, step + 7)
         let idx = rows(perm, 0, 10)
@@ -64,16 +56,14 @@ fn main() {
         if step % 40 == 0 {
             print(l)
         }
-        yield state with {
-            w1: map(w1, dw1) |a, g| { yield a - 0.3 * g },
-            b1: map(b1, db1) |a, g| { yield a - 0.3 * g },
-            w2: map(w2, dw2) |a, g| { yield a - 0.3 * g },
-            b2: map(b2, db2) |a, g| { yield a - 0.3 * g }
-        }
+        yield map(w1, dw1) |a, g| { yield a - 0.3 * g },
+              map(b1, db1) |a, g| { yield a - 0.3 * g },
+              map(w2, dw2) |a, g| { yield a - 0.3 * g },
+              map(b2, db2) |a, g| { yield a - 0.3 * g }
     }
 
     // The accuracy on the whole data set.
-    let hidden = relu(add_bias(matmul(images, trained.w1), trained.b1))
-    let logits = add_bias(matmul(hidden, trained.w2), trained.b2)
+    let hidden = relu(add_bias(matmul(images, w1), b1))
+    let logits = add_bias(matmul(hidden, w2), b2)
     print(accuracy(logits, labels))
 }

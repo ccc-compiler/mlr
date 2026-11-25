@@ -247,6 +247,10 @@ pub enum TExpr {
         iter: Vec<TIter>,
         body: Box<TBlock>,
         ty: CType,
+        /// The anonymous struct of ALL the loop-carried values, when there
+        /// are several: `let (a, b) = for ... iter(a = .., b = ..)` unpacks
+        /// it.
+        multi: Option<usize>,
     },
     Map {
         inputs: Vec<TExpr>,
@@ -743,7 +747,15 @@ impl Checker {
                 }
                 Stmt::LetMulti(m) => {
                     let v = self.check_expr(&m.value)?;
-                    let id = self.struct_of(&v.ty(), "the unpacked value", &m.span)?;
+                    // A `for` unpacks into all of its loop-carried values.
+                    let for_id = match &v {
+                        TExpr::For { multi: Some(id), .. } => Some(*id),
+                        _ => None,
+                    };
+                    let id = match for_id {
+                        Some(id) => id,
+                        None => self.struct_of(&v.ty(), "the unpacked value", &m.span)?,
+                    };
                     let fields = self.structs[id].fields.clone();
                     if fields.len() != m.names.len() {
                         return err(
@@ -1031,8 +1043,19 @@ impl Checker {
                     let _ = i;
                 }
                 // The value of a `for` expression is the final value of its
-                // loop-carried values.
+                // loop-carried values. When there are several, an anonymous
+                // struct of all of them is available to `let (a, b) = ...`.
                 let ty = titer.first().map(|it| it.ty.clone()).unwrap_or(CType::Void);
+                let multi = if titer.len() > 1 {
+                    let id = self.structs.len();
+                    self.structs.push(TStructDef {
+                        name: format!("@for:{}", var),
+                        fields: titer.iter().map(|it| (it.name.clone(), it.ty.clone())).collect(),
+                    });
+                    Some(id)
+                } else {
+                    None
+                };
                 Ok(TExpr::For {
                     var: var.clone(),
                     lb: Box::new(lb),
@@ -1040,6 +1063,7 @@ impl Checker {
                     step: Box::new(step),
                     iter: titer,
                     body: Box::new(body),
+                    multi,
                     ty,
                 })
             }
