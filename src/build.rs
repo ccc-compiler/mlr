@@ -217,21 +217,28 @@ impl IrBuilder {
             module.funcs.push(grad_fn);
         }
         for r in &self.runtime {
-            let (arg, res) = match r.as_str() {
-                "mlr_print_i32" => ("i32", vec![]),
-                "mlr_print_i64" => ("i64", vec![]),
-                "mlr_print_f32" => ("f32", vec![]),
-                "mlr_print_f64" => ("f64", vec![]),
-                "mlr_print_byte" => ("i32", vec![]),
-                "mlr_exp" | "mlr_ln" | "mlr_sqrt" | "mlr_tanh" | "mlr_sigmoid" | "mlr_gelu" => {
-                    ("f32", vec![ir::Type::scalar("f32").unwrap()])
-                }
-                _ => ("i1", vec![]),
+            let t = |n: &str| Type::scalar(n).unwrap();
+            let (params, results): (Vec<Type>, Vec<Type>) = match r.as_str() {
+                "mlr_print_i32" => (vec![t("i32")], vec![]),
+                "mlr_print_i64" => (vec![t("i64")], vec![]),
+                "mlr_print_f32" => (vec![t("f32")], vec![]),
+                "mlr_print_f64" => (vec![t("f64")], vec![]),
+                "mlr_print_byte" => (vec![t("i32")], vec![]),
+                "mlr_print_bool" => (vec![t("i1")], vec![]),
+                "mlr_exp" | "mlr_ln" | "mlr_sqrt" | "mlr_tanh" | "mlr_sigmoid"
+                | "mlr_gelu" | "mlr_abs" | "mlr_floor" | "mlr_ceil" | "mlr_round"
+                | "mlr_sign" => (vec![t("f32")], vec![t("f32")]),
+                "mlr_is_nan" | "mlr_is_finite" => (vec![t("f32")], vec![t("i1")]),
+                "mlr_pow" | "mlr_min" | "mlr_max" => (vec![t("f32"), t("f32")], vec![t("f32")]),
+                "mlr_clamp" => (vec![t("f32"), t("f32"), t("f32")], vec![t("f32")]),
+                "mlr_now_ms" => (vec![], vec![t("i64")]),
+                "mlr_exit" => (vec![t("i32")], vec![]),
+                _ => (vec![t("i1")], vec![]),
             };
             module.decls.push(ir::FuncDecl {
                 name: r.clone(),
-                params: vec![Type::scalar(arg).unwrap()],
-                results: res,
+                params,
+                results,
             });
         }
         module
@@ -634,6 +641,30 @@ impl IrBuilder {
                 self.emit(o);
                 res
             }
+            TExpr::Sys { kind, cmd, args, ty } => {
+                let name = match kind {
+                    crate::check::SysKind::Exec => "mlr.exec",
+                    crate::check::SysKind::ExecI => "mlr.exec_i",
+                    crate::check::SysKind::ExecF => "mlr.exec_f",
+                    crate::check::SysKind::ExecTensor => "mlr.exec_tensor",
+                    crate::check::SysKind::Assert => "mlr.assert",
+                };
+                let mut o = Op::new(name);
+                o.generic = true;
+                o.attrs.push(("cmd".into(), Attr::Str(cmd.clone())));
+                for a in args {
+                    o.operands.push(self.expr(a));
+                }
+                if matches!(ty, CType::Void) {
+                    self.emit(o);
+                    self.fresh(Type::Void)
+                } else {
+                    let res = self.fresh(self.ty(ty));
+                    o.results.push(res.clone());
+                    self.emit(o);
+                    res
+                }
+            }
             TExpr::Struct { def, fields, ty } => {
                 let mut leaves = Vec::new();
                 for f in fields {
@@ -875,6 +906,7 @@ impl IrBuilder {
                 let v = self.expr(&args[0]);
                 let fname = match &v.ty {
                     Type::Scalar(k) => match k.name() {
+                        "i1" | "bool" => "mlr_print_bool",
                         "i32" => "mlr_print_i32",
                         "i64" => "mlr_print_i64",
                         "f32" => "mlr_print_f32",
@@ -926,6 +958,11 @@ impl IrBuilder {
         }
         let mut o = Op::new("func.call");
         o.attrs.push(("callee".into(), Attr::Str(name.into())));
+        // A call of the runtime library (its names start with `mlr_`) has to
+        // be declared.
+        if name.starts_with("mlr_") && !self.runtime.iter().any(|r| r == name) {
+            self.runtime.push(name.to_string());
+        }
         for a in args {
             let v = self.expr(a);
             o.operands.extend(self.leaves(&v));
@@ -1366,6 +1403,7 @@ fn body_is_impure(block: &TBlock) -> bool {
             TExpr::With { recv, updates, .. } => {
                 expr_impure(recv) || updates.iter().any(|(_, v)| expr_impure(v))
             }
+            TExpr::Sys { .. } => true,
             _ => false,
         }
     }

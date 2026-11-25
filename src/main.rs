@@ -161,6 +161,10 @@ fn main() -> ExitCode {
     ir::renumber(&mut module);
 
     if let Err(e) = ir::verify(&module) {
+        if std::env::var("MLR_DUMP_IR").is_ok() {
+            let mlir = ir::print_module(&module);
+            eprintln!("{}", mlir);
+        }
         eprintln!("mlr: error: the generated IR is invalid: {}", e);
         return ExitCode::FAILURE;
     }

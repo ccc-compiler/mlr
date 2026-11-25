@@ -591,6 +591,164 @@ impl S {
 }
 
 #[test]
+fn uses_the_scalar_math_of_the_library() {
+    let mlir = compile(
+        r#"
+fn main() {
+    print(abs(0.0 - 5.0))
+    print(min(3.0, 7.0))
+    print(clamp(10.0, 0.0, 5.0))
+    print(pow(2.0, 10.0))
+    print(pi())
+}
+"#,
+    );
+    assert!(mlir.contains("func.call @mlr_abs"), "{}", mlir);
+    assert!(mlir.contains("func.call @mlr_clamp"), "{}", mlir);
+    assert!(mlir.contains("func.call @mlr_pow"), "{}", mlir);
+    verify_mlir(&mlir);
+}
+
+#[test]
+fn uses_the_tensor_functions_of_the_library() {
+    let mlir = compile(
+        r#"
+fn main() {
+    let a = tensor.zeros<Tensor<2x2xf32>>()
+    let b = tensor.zeros<Tensor<2x2xf32>>()
+    let m = tmin(a, b)
+    let n = mean(a)
+    let v = norm2(a)
+    let r = reshape<Tensor<4xf32>>(m)
+    print(n + v)
+    print(tensor.extract(r, [0]))
+}
+"#,
+    );
+    assert!(mlir.contains("mlr_tmin"), "{}", mlir);
+    assert!(mlir.contains("mlr_mean"), "{}", mlir);
+    assert!(mlir.contains("mlr_norm2"), "{}", mlir);
+    assert!(mlir.contains("mlr_copy"), "{}", mlir);
+    verify_mlir(&mlir);
+}
+
+#[test]
+fn runs_the_shell_bridge() {
+    let Some(out) = run(
+        r#"
+fn main() {
+    let code = exec("true")
+    print(code)
+    let bad = exec("false")
+    print(bad)
+    let n = exec_i("echo 42")
+    print(n)
+    let f = exec_f("echo 2.5")
+    print(f)
+    let a = exec_i("echo {0}", 40)
+    print(a + 2)
+}
+"#,
+    ) else {
+        eprintln!("skipping: the LLVM tool chain is not available");
+        return;
+    };
+    assert_eq!(
+        out.lines().collect::<Vec<_>>(),
+        vec!["0", "1", "42", "2.500000", "42"]
+    );
+}
+
+#[test]
+fn rejects_a_shell_command_that_is_not_a_literal() {
+    let err = compile_err(
+        r#"
+fn main() {
+    exec(1)
+}
+"#,
+    );
+    assert!(err.contains("string literal"), "{}", err);
+}
+
+#[test]
+fn rejects_exec_in_a_differentiated_function() {
+    let err = compile_err(
+        r#"
+fn loss(w: Tensor<2x2xf32>, x: Tensor<2x2xf32>) -> f32 {
+    let c = exec("true")
+    yield sum(matmul(x, w))
+}
+
+fn main() {
+    let w = tensor.zeros<Tensor<2x2xf32>>()
+    let x = tensor.zeros<Tensor<2x2xf32>>()
+    let (l, dw, _) = value_and_grad(loss, w, x)
+    print(l)
+}
+"#,
+    );
+    assert!(err.contains("cannot be differentiated"), "{}", err);
+}
+
+#[test]
+fn uses_the_random_functions_of_the_library() {
+    let Some(out) = run(
+        r#"
+fn main() {
+    let r1 = rand_uniform<Tensor<3xf32>>(7, 0.0, 1.0)
+    let r2 = rand_uniform<Tensor<3xf32>>(7, 0.0, 1.0)
+    let d = map(r1, r2) |p, q| {
+        yield p - q
+    }
+    print(sum(d))
+    let g = rand_normal<Tensor<3xf32>>(3, 0.0, 1.0)
+    print(tmax(g) > tmin(g))
+    let perm = rand_permutation(6, 11)
+    print(tensor.extract(perm, [0]) != tensor.extract(perm, [1]))
+}
+"#,
+    ) else {
+        eprintln!("skipping: the LLVM tool chain is not available");
+        return;
+    };
+    let lines: Vec<&str> = out.lines().collect();
+    // The same seed gives the same values: the difference is zero.
+    assert_eq!(lines[0], "0.000000", "{}", out);
+    assert_eq!(lines[1], "true", "{}", out);
+    assert_eq!(lines[2], "true", "{}", out);
+}
+
+#[test]
+fn reads_a_tensor_from_the_shell() {
+    let Some(out) = run(
+        r#"
+fn main() {
+    let w = exec_tensor<Tensor<2x3xf32>>("python3 -c 'print(1, 2, 3); print(4, 5, 6)'")
+    print(tensor.extract(w, [1, 2]))
+}
+"#,
+    ) else {
+        eprintln!("skipping: the LLVM tool chain is not available");
+        return;
+    };
+    assert_eq!(out.trim(), "6.000000", "{}", out);
+}
+
+#[test]
+fn runs_the_mini_batch_training() {
+    let Some(out) = run_script("scripts/run.sh", "examples/train/train_mnist_full.mlr") else {
+        eprintln!("skipping: the LLVM tool chain is not available");
+        return;
+    };
+    let lines: Vec<&str> = out.lines().collect();
+    assert_eq!(lines.len(), 6, "{}", out);
+    let first: f32 = lines[0].parse().unwrap();
+    assert!((first - 2.30).abs() < 0.01, "{}", out);
+    assert_eq!(lines[5], "1.000000", "{}", out);
+}
+
+#[test]
 fn differentiates_a_function() {
     let mlir = compile(
         r#"

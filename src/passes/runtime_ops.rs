@@ -191,6 +191,251 @@ const RUNTIME: &[RuntimeFn] = &[
         result: None,
     },
     RuntimeFn {
+        name: "mlr_tmin",
+        params: &["index", "index", "index", "index"],
+        result: None,
+    },
+    RuntimeFn {
+        name: "mlr_tmax",
+        params: &["index", "index", "index", "index"],
+        result: None,
+    },
+    RuntimeFn {
+        name: "mlr_tclamp",
+        params: &["index", "f32", "f32", "index", "index"],
+        result: None,
+    },
+    RuntimeFn {
+        name: "mlr_tpow",
+        params: &["index", "f32", "index", "index"],
+        result: None,
+    },
+    RuntimeFn {
+        name: "mlr_texp",
+        params: &["index", "index", "index"],
+        result: None,
+    },
+    RuntimeFn {
+        name: "mlr_tln",
+        params: &["index", "index", "index"],
+        result: None,
+    },
+    RuntimeFn {
+        name: "mlr_mean",
+        params: &["index", "index"],
+        result: Some("f32"),
+    },
+    RuntimeFn {
+        name: "mlr_tmax_value",
+        params: &["index", "index"],
+        result: Some("f32"),
+    },
+    RuntimeFn {
+        name: "mlr_tmin_value",
+        params: &["index", "index"],
+        result: Some("f32"),
+    },
+    RuntimeFn {
+        name: "mlr_argmin",
+        params: &["index", "index"],
+        result: Some("i32"),
+    },
+    RuntimeFn {
+        name: "mlr_norm1",
+        params: &["index", "index"],
+        result: Some("f32"),
+    },
+    RuntimeFn {
+        name: "mlr_norm2",
+        params: &["index", "index"],
+        result: Some("f32"),
+    },
+    RuntimeFn {
+        name: "mlr_var",
+        params: &["index", "index"],
+        result: Some("f32"),
+    },
+    RuntimeFn {
+        name: "mlr_std",
+        params: &["index", "index"],
+        result: Some("f32"),
+    },
+    RuntimeFn {
+        name: "mlr_dot",
+        params: &["index", "index", "index"],
+        result: Some("f32"),
+    },
+    RuntimeFn {
+        name: "mlr_copy",
+        params: &["index", "index", "index"],
+        result: None,
+    },
+    RuntimeFn {
+        name: "mlr_concat",
+        params: &["index", "index", "index", "index", "index", "index"],
+        result: None,
+    },
+    RuntimeFn {
+        name: "mlr_rows",
+        params: &["index", "i32", "i32", "index", "index"],
+        result: None,
+    },
+    RuntimeFn {
+        name: "mlr_reverse",
+        params: &["index", "index", "index", "index"],
+        result: None,
+    },
+    RuntimeFn {
+        name: "mlr_exec",
+        params: &["index", "index", "index"],
+        result: Some("i32"),
+    },
+    RuntimeFn {
+        name: "mlr_exec_num",
+        params: &["index", "index", "index", "index"],
+        result: Some("i64"),
+    },
+    RuntimeFn {
+        name: "mlr_exec_tensor",
+        params: &["index", "index", "index", "index", "index"],
+        result: None,
+    },
+    RuntimeFn {
+        name: "mlr_assert",
+        params: &["i32", "index"],
+        result: None,
+    },
+    RuntimeFn {
+        name: "mlr_tmin_grad",
+        params: &["index", "index", "index", "index", "index", "index"],
+        result: None,
+    },
+    RuntimeFn {
+        name: "mlr_tmax_grad",
+        params: &["index", "index", "index", "index", "index", "index"],
+        result: None,
+    },
+    RuntimeFn {
+        name: "mlr_tclamp_grad",
+        params: &["index", "f32", "f32", "index", "index", "index"],
+        result: None,
+    },
+    RuntimeFn {
+        name: "mlr_tpow_grad",
+        params: &["index", "f32", "index", "index", "index"],
+        result: None,
+    },
+    RuntimeFn {
+        name: "mlr_texp_grad",
+        params: &["index", "index", "index", "index"],
+        result: None,
+    },
+    RuntimeFn {
+        name: "mlr_tln_grad",
+        params: &["index", "index", "index", "index"],
+        result: None,
+    },
+    RuntimeFn {
+        name: "mlr_tmax_grad_value",
+        params: &["index", "f32", "index", "index"],
+        result: None,
+    },
+    RuntimeFn {
+        name: "mlr_tmin_grad_value",
+        params: &["index", "f32", "index", "index"],
+        result: None,
+    },
+    RuntimeFn {
+        name: "mlr_norm1_grad",
+        params: &["index", "f32", "index", "index"],
+        result: None,
+    },
+    RuntimeFn {
+        name: "mlr_norm2_grad",
+        params: &["index", "f32", "f32", "index", "index"],
+        result: None,
+    },
+    RuntimeFn {
+        name: "mlr_var_grad",
+        params: &["index", "f32", "index", "index"],
+        result: None,
+    },
+    RuntimeFn {
+        name: "mlr_std_grad",
+        params: &["index", "f32", "index", "index"],
+        result: None,
+    },
+    RuntimeFn {
+        name: "mlr_scale_fill",
+        params: &["index", "f32", "index", "index"],
+        result: None,
+    },
+    RuntimeFn {
+        name: "mlr_concat_grad",
+        params: &["index", "index", "index", "index", "index", "index"],
+        result: None,
+    },
+    RuntimeFn {
+        name: "mlr_rows_grad",
+        params: &["index", "i32", "i32", "index", "index", "index"],
+        result: None,
+    },
+    RuntimeFn {
+        name: "mlr_iota",
+        params: &["index", "i32"],
+        result: None,
+    },
+    RuntimeFn {
+        name: "mlr_linspace",
+        params: &["f32", "f32", "i32", "index"],
+        result: None,
+    },
+    RuntimeFn {
+        name: "mlr_onehot",
+        params: &["index", "index", "i32", "i32"],
+        result: None,
+    },
+    RuntimeFn {
+        name: "mlr_rand_uniform",
+        params: &["index", "i32", "f32", "f32", "index"],
+        result: None,
+    },
+    RuntimeFn {
+        name: "mlr_rand_normal",
+        params: &["index", "i32", "f32", "f32", "index"],
+        result: None,
+    },
+    RuntimeFn {
+        name: "mlr_rand_permutation",
+        params: &["index", "i32", "i32"],
+        result: None,
+    },
+    RuntimeFn {
+        name: "mlr_gather",
+        params: &["index", "index", "index", "index", "index", "index"],
+        result: None,
+    },
+    RuntimeFn {
+        name: "mlr_gather_grad",
+        params: &["index", "index", "index", "index", "index", "index"],
+        result: None,
+    },
+    RuntimeFn {
+        name: "mlr_dropout",
+        params: &["index", "i32", "f32", "index", "index"],
+        result: None,
+    },
+    RuntimeFn {
+        name: "mlr_dropout_grad",
+        params: &["index", "index", "i32", "f32", "index", "index"],
+        result: None,
+    },
+    RuntimeFn {
+        name: "mlr_accuracy",
+        params: &["index", "index", "index", "index"],
+        result: Some("f32"),
+    },
+    RuntimeFn {
         name: "mlr_relu_grad",
         params: &["index", "index", "index", "index"],
         result: None,
@@ -297,6 +542,74 @@ fn lower_ops(
             "mlr.softmax_grad" => lower_softmax_grad(op, used, &mut out),
             "mlr.softmax_tri_grad" => lower_softmax_tri_grad(op, used, &mut out),
             "mlr.layernorm_grad" => lower_layernorm_grad(op, used, &mut out),
+            "mlr.tmin" | "mlr.tmax" => {
+                if op.operands.len() == 2 {
+                    let name = if op.name == "mlr.tmin" { "mlr_tmin" } else { "mlr_tmax" };
+                    lower_tminmax(op, used, &mut out, name);
+                } else {
+                    let name = if op.name == "mlr.tmin" {
+                        "mlr_tmin_value"
+                    } else {
+                        "mlr_tmax_value"
+                    };
+                    lower_to_scalar(op, used, &mut out, name);
+                }
+            }
+            "mlr.tclamp" => lower_tscalar(op, used, &mut out, "mlr_tclamp"),
+            "mlr.tpow" => lower_tscalar(op, used, &mut out, "mlr_tpow"),
+            "mlr.texp" => lower_tunary(op, used, &mut out, "mlr_texp"),
+            "mlr.tln" => lower_tunary(op, used, &mut out, "mlr_tln"),
+            "mlr.mean" => lower_to_scalar(op, used, &mut out, "mlr_mean"),
+            "mlr.norm1" => lower_to_scalar(op, used, &mut out, "mlr_norm1"),
+            "mlr.norm2" => lower_to_scalar(op, used, &mut out, "mlr_norm2"),
+            "mlr.var" => lower_to_scalar(op, used, &mut out, "mlr_var"),
+            "mlr.std" => lower_to_scalar(op, used, &mut out, "mlr_std"),
+            "mlr.dot" => lower_dot(op, used, &mut out),
+            "mlr.reshape" => lower_copy(op, used, &mut out),
+            "mlr.concat" => lower_concat(op, used, &mut out),
+            "mlr.rows" => lower_rows(op, used, &mut out),
+            "mlr.reverse" => lower_reverse(op, used, &mut out),
+            "mlr.tmin_grad" => lower_two_grads(op, used, &mut out, "mlr_tmin_grad"),
+            "mlr.tmax_grad" => lower_two_grads(op, used, &mut out, "mlr_tmax_grad"),
+            "mlr.tclamp_grad" => lower_scalar_grad(op, used, &mut out, "mlr_tclamp_grad"),
+            "mlr.tpow_grad" => lower_scalar_grad(op, used, &mut out, "mlr_tpow_grad"),
+            "mlr.texp_grad" => lower_scalar_grad(op, used, &mut out, "mlr_texp_grad"),
+            "mlr.tln_grad" => lower_scalar_grad(op, used, &mut out, "mlr_tln_grad"),
+            "mlr.norm1_grad" => lower_scalar_grad(op, used, &mut out, "mlr_norm1_grad"),
+            "mlr.var_grad" => lower_scalar_grad(op, used, &mut out, "mlr_var_grad"),
+            "mlr.std_grad" => lower_scalar_grad(op, used, &mut out, "mlr_std_grad"),
+            "mlr.tmax_grad_value" => {
+                lower_scalar_grad(op, used, &mut out, "mlr_tmax_grad_value")
+            }
+            "mlr.tmin_grad_value" => {
+                lower_scalar_grad(op, used, &mut out, "mlr_tmin_grad_value")
+            }
+            "mlr.norm2_grad" => lower_norm2_grad(op, used, &mut out),
+            "mlr.dot_grad" => lower_dot_grad(op, used, &mut out),
+            "mlr.reshape_grad" => lower_copy_grad(op, used, &mut out, "mlr_copy"),
+            "mlr.concat_grad" => lower_concat_grad(op, used, &mut out),
+            "mlr.rows_grad" => lower_rows_grad(op, used, &mut out),
+            "mlr.iota" => lower_iota(op, used, &mut out),
+            "mlr.linspace" => lower_linspace(op, used, &mut out),
+            "mlr.onehot" => lower_onehot(op, used, &mut out),
+            "mlr.rand_uniform" => lower_rand(op, used, &mut out, "mlr_rand_uniform"),
+            "mlr.rand_normal" => lower_rand(op, used, &mut out, "mlr_rand_normal"),
+            "mlr.rand_permutation" => {
+                lower_rand_permutation(op, used, &mut out)
+            }
+            "mlr.gather" => lower_gather(op, used, &mut out),
+            "mlr.gather_grad" => lower_gather_grad(op, used, &mut out),
+            "mlr.dropout" => lower_dropout(op, used, &mut out),
+            "mlr.dropout_grad" => lower_dropout_grad(op, used, &mut out),
+            "mlr.accuracy" => lower_accuracy(op, used, &mut out),
+            "mlr.exec" => lower_exec(op, used, &mut out, globals, counter),
+            "mlr.exec_i" | "mlr.exec_f" => {
+                lower_exec_num(op, used, &mut out, globals, counter)
+            }
+            "mlr.exec_tensor" => {
+                lower_exec_tensor(op, used, &mut out, globals, counter)
+            }
+            "mlr.assert" => lower_assert(op, used, &mut out, globals, counter),
             "mlr.zeros" => lower_zeros(op, used, &mut out),
             "mlr.add" => lower_add_elem(op, used, &mut out),
             "mlr.matmul_grad" => lower_matmul_grad(op, used, &mut out),
@@ -1736,6 +2049,1036 @@ fn lower_layernorm_grad(op: Op, used: &mut Vec<&'static str>, out: &mut Vec<Op>)
         pdb.results[0].clone(),
         crows.results[0].clone(),
         cwidth.results[0].clone(),
+    ];
+    out.push(call);
+}
+
+// ───────── the standard library ─────────
+
+/// The two-operand element wise functions: (a, b) -> out.
+fn lower_tminmax(op: Op, used: &mut Vec<&'static str>, out: &mut Vec<Op>, name: &'static str) {
+    used.push(name);
+    let a = op.operands[0].clone();
+    let b = op.operands[1].clone();
+    let result = op.results[0].clone();
+    let n = count(&result.ty);
+    let mut l = Lowerer { b: Builder::new() };
+    let out_ty = match &result.ty {
+        Type::MemRef { .. } => result.ty.clone(),
+        t => t.clone(),
+    };
+    out.push(l.alloc(out_ty, &result));
+    let pa = l.pointer(&a);
+    let pb = l.pointer(&b);
+    let pout = l.pointer(&result);
+    let cn = l.const_index(n);
+    out.push(pa.clone());
+    out.push(pb.clone());
+    out.push(pout.clone());
+    out.push(cn.clone());
+    let mut call = Op::new("func.call");
+    call.attrs.push(("callee".into(), Attr::Str(name.to_string())));
+    call.operands = vec![
+        pa.results[0].clone(),
+        pb.results[0].clone(),
+        pout.results[0].clone(),
+        cn.results[0].clone(),
+    ];
+    out.push(call);
+}
+
+/// The element wise functions with one f32 scalar: (x, s[, s2]) -> out.
+fn lower_tscalar(op: Op, used: &mut Vec<&'static str>, out: &mut Vec<Op>, name: &'static str) {
+    used.push(name);
+    let x = op.operands[0].clone();
+    let result = op.results[0].clone();
+    let n = count(&result.ty);
+    let mut l = Lowerer { b: Builder::new() };
+    let out_ty = match &result.ty {
+        Type::MemRef { .. } => result.ty.clone(),
+        t => t.clone(),
+    };
+    out.push(l.alloc(out_ty, &result));
+    let px = l.pointer(&x);
+    let pout = l.pointer(&result);
+    let cn = l.const_index(n);
+    out.push(px.clone());
+    out.push(pout.clone());
+    out.push(cn.clone());
+    let mut call = Op::new("func.call");
+    call.attrs.push(("callee".into(), Attr::Str(name.to_string())));
+    call.operands = vec![px.results[0].clone()];
+    call.operands.extend(op.operands[1..].iter().cloned());
+    call.operands.push(pout.results[0].clone());
+    call.operands.push(cn.results[0].clone());
+    out.push(call);
+}
+
+/// The one-operand element wise functions of the forward pass: (x) -> out.
+fn lower_tunary(op: Op, used: &mut Vec<&'static str>, out: &mut Vec<Op>, name: &'static str) {
+    used.push(name);
+    let x = op.operands[0].clone();
+    let result = op.results[0].clone();
+    let n = count(&result.ty);
+    let mut l = Lowerer { b: Builder::new() };
+    let out_ty = match &result.ty {
+        Type::MemRef { .. } => result.ty.clone(),
+        t => t.clone(),
+    };
+    out.push(l.alloc(out_ty, &result));
+    let px = l.pointer(&x);
+    let pout = l.pointer(&result);
+    let cn = l.const_index(n);
+    out.push(px.clone());
+    out.push(pout.clone());
+    out.push(cn.clone());
+    let mut call = Op::new("func.call");
+    call.attrs.push(("callee".into(), Attr::Str(name.to_string())));
+    call.operands = vec![
+        px.results[0].clone(),
+        pout.results[0].clone(),
+        cn.results[0].clone(),
+    ];
+    out.push(call);
+}
+
+/// The reductions: (x) -> a scalar.
+fn lower_to_scalar(
+    op: Op,
+    used: &mut Vec<&'static str>,
+    out: &mut Vec<Op>,
+    name: &'static str,
+) {
+    used.push(name);
+    let x = op.operands[0].clone();
+    let result = op.results[0].clone();
+    let n = count(&x.ty);
+    let mut l = Lowerer { b: Builder::new() };
+    let px = l.pointer(&x);
+    let cn = l.const_index(n);
+    out.push(px.clone());
+    out.push(cn.clone());
+    let mut call = Op::new("func.call");
+    call.attrs.push(("callee".into(), Attr::Str(name.to_string())));
+    call.operands = vec![px.results[0].clone(), cn.results[0].clone()];
+    call.results.push(result);
+    out.push(call);
+}
+
+/// The inner product of two rank-1 tensors: (a, b) -> f32.
+fn lower_dot(op: Op, used: &mut Vec<&'static str>, out: &mut Vec<Op>) {
+    used.push("mlr_dot");
+    let a = op.operands[0].clone();
+    let b = op.operands[1].clone();
+    let result = op.results[0].clone();
+    let n = count(&a.ty);
+    let mut l = Lowerer { b: Builder::new() };
+    let pa = l.pointer(&a);
+    let pb = l.pointer(&b);
+    let cn = l.const_index(n);
+    out.push(pa.clone());
+    out.push(pb.clone());
+    out.push(cn.clone());
+    let mut call = Op::new("func.call");
+    call.attrs.push(("callee".into(), Attr::Str("mlr_dot".into())));
+    call.operands = vec![
+        pa.results[0].clone(),
+        pb.results[0].clone(),
+        cn.results[0].clone(),
+    ];
+    call.results.push(result);
+    out.push(call);
+}
+
+/// The reshape: a copy with the same element count.
+fn lower_copy(op: Op, used: &mut Vec<&'static str>, out: &mut Vec<Op>) {
+    used.push("mlr_copy");
+    let x = op.operands[0].clone();
+    let result = op.results[0].clone();
+    let n = count(&result.ty);
+    let mut l = Lowerer { b: Builder::new() };
+    let out_ty = match &result.ty {
+        Type::MemRef { .. } => result.ty.clone(),
+        t => t.clone(),
+    };
+    out.push(l.alloc(out_ty, &result));
+    let px = l.pointer(&x);
+    let pout = l.pointer(&result);
+    let cn = l.const_index(n);
+    out.push(px.clone());
+    out.push(pout.clone());
+    out.push(cn.clone());
+    let mut call = Op::new("func.call");
+    call.attrs.push(("callee".into(), Attr::Str("mlr_copy".into())));
+    call.operands = vec![
+        px.results[0].clone(),
+        pout.results[0].clone(),
+        cn.results[0].clone(),
+    ];
+    out.push(call);
+}
+
+/// The concatenation along the first axis: (a, b) -> out.
+fn lower_concat(op: Op, used: &mut Vec<&'static str>, out: &mut Vec<Op>) {
+    used.push("mlr_concat");
+    let a = op.operands[0].clone();
+    let b = op.operands[1].clone();
+    let result = op.results[0].clone();
+    let d = dims(&result.ty);
+    let rowsize: i64 = d[1..].iter().product();
+    let (rowsa, rowsb) = (dims(&a.ty)[0], dims(&b.ty)[0]);
+    let mut l = Lowerer { b: Builder::new() };
+    let out_ty = match &result.ty {
+        Type::MemRef { .. } => result.ty.clone(),
+        t => t.clone(),
+    };
+    out.push(l.alloc(out_ty, &result));
+    let pa = l.pointer(&a);
+    let pb = l.pointer(&b);
+    let pout = l.pointer(&result);
+    let ca = l.const_index(rowsa);
+    let cb = l.const_index(rowsb);
+    let cs = l.const_index(rowsize);
+    out.push(pa.clone());
+    out.push(pb.clone());
+    out.push(pout.clone());
+    out.push(ca.clone());
+    out.push(cb.clone());
+    out.push(cs.clone());
+    let mut call = Op::new("func.call");
+    call.attrs.push(("callee".into(), Attr::Str("mlr_concat".into())));
+    call.operands = vec![
+        pa.results[0].clone(),
+        pb.results[0].clone(),
+        pout.results[0].clone(),
+        ca.results[0].clone(),
+        cb.results[0].clone(),
+        cs.results[0].clone(),
+    ];
+    out.push(call);
+}
+
+/// The slice of the rows: (t, start, count) -> out. The result keeps the
+/// element type of the input.
+fn lower_rows(op: Op, used: &mut Vec<&'static str>, out: &mut Vec<Op>) {
+    used.push("mlr_rows");
+    let t = op.operands[0].clone();
+    let start = op.operands[1].clone();
+    let count = op.operands[2].clone();
+    let result = op.results[0].clone();
+    let d = dims(&t.ty);
+    let rowsize: i64 = d[1..].iter().product();
+    let mut l = Lowerer { b: Builder::new() };
+    let out_ty = match &result.ty {
+        Type::MemRef { .. } => result.ty.clone(),
+        t2 => t2.clone(),
+    };
+    out.push(l.alloc(out_ty, &result));
+    let pt = l.pointer(&t);
+    let pout = l.pointer(&result);
+    let cs = l.const_index(rowsize);
+    out.push(pt.clone());
+    out.push(pout.clone());
+    out.push(cs.clone());
+    let mut call = Op::new("func.call");
+    call.attrs.push(("callee".into(), Attr::Str("mlr_rows".into())));
+    call.operands = vec![
+        pt.results[0].clone(),
+        start,
+        count,
+        pout.results[0].clone(),
+        cs.results[0].clone(),
+    ];
+    out.push(call);
+}
+
+/// The reverse along the first axis: (x) -> out.
+fn lower_reverse(op: Op, used: &mut Vec<&'static str>, out: &mut Vec<Op>) {
+    used.push("mlr_reverse");
+    let x = op.operands[0].clone();
+    let result = op.results[0].clone();
+    let d = dims(&x.ty);
+    let (rows, rowsize) = (d[0], d[1..].iter().product::<i64>().max(1));
+    let mut l = Lowerer { b: Builder::new() };
+    let out_ty = match &result.ty {
+        Type::MemRef { .. } => result.ty.clone(),
+        t => t.clone(),
+    };
+    out.push(l.alloc(out_ty, &result));
+    let px = l.pointer(&x);
+    let pout = l.pointer(&result);
+    let cr = l.const_index(rows);
+    let cs = l.const_index(rowsize);
+    out.push(px.clone());
+    out.push(pout.clone());
+    out.push(cr.clone());
+    out.push(cs.clone());
+    let mut call = Op::new("func.call");
+    call.attrs.push(("callee".into(), Attr::Str("mlr_reverse".into())));
+    call.operands = vec![
+        px.results[0].clone(),
+        pout.results[0].clone(),
+        cr.results[0].clone(),
+        cs.results[0].clone(),
+    ];
+    out.push(call);
+}
+
+
+/// The shell bridge: the command template lives in a string global, the
+/// arguments of the command in an f64 buffer. `mlr_exec` returns the exit
+/// code.
+fn lower_exec(
+    op: Op,
+    used: &mut Vec<&'static str>,
+    out: &mut Vec<Op>,
+    globals: &mut Vec<crate::ir::Global>,
+    counter: &mut usize,
+) {
+    used.push("mlr_exec");
+    let cmd = match op.attr("cmd") {
+        Some(Attr::Str(s)) => s.clone(),
+        _ => String::new(),
+    };
+    let mut l = Lowerer { b: Builder::new() };
+    let pc = l.string_ptr(globals, counter, &cmd, out);
+    let (parr, cn) = args_buffer(&op, out, &mut l);
+    let mut call = Op::new("func.call");
+    call.attrs.push(("callee".into(), Attr::Str("mlr_exec".into())));
+    call.operands = vec![pc, cn, parr];
+    if let Some(result) = op.results.first() {
+        call.results.push(result.clone());
+    }
+    out.push(call);
+}
+
+/// The numeric shell bridge: `mlr_exec_num(cmd, kind, n, args)` returns the
+/// parsed number as the bits of an i64; kind 1 is an integer, kind 2 a
+/// float. The lowering converts the bits to the result type.
+fn lower_exec_num(
+    op: Op,
+    used: &mut Vec<&'static str>,
+    out: &mut Vec<Op>,
+    globals: &mut Vec<crate::ir::Global>,
+    counter: &mut usize,
+) {
+    used.push("mlr_exec_num");
+    let kind = if op.name == "mlr.exec_i" { 1 } else { 2 };
+    let cmd = match op.attr("cmd") {
+        Some(Attr::Str(s)) => s.clone(),
+        _ => String::new(),
+    };
+    let mut l = Lowerer { b: Builder::new() };
+    let pc = l.string_ptr(globals, counter, &cmd, out);
+    let (parr, cn) = args_buffer(&op, out, &mut l);
+    let ck = l.const_index(kind);
+    out.push(ck.clone());
+    let mut call = Op::new("func.call");
+    call
+        .attrs
+        .push(("callee".into(), Attr::Str("mlr_exec_num".into())));
+    call.operands = vec![pc, ck.results[0].clone(), cn, parr];
+    let bits = l.b.fresh_value(Type::Scalar(crate::ir::ScalarKind::I64));
+    call.results.push(bits.clone());
+    out.push(call);
+    let result = op.results[0].clone();
+    if result.ty == Type::Scalar(crate::ir::ScalarKind::I32) {
+        // The conversion produces the value of the original result, so that
+        // the operations after it see it.
+        let mut trunc = Op::new("arith.trunci");
+        trunc.operands.push(bits);
+        trunc
+            .results
+            .push(Value { id: result.id, ty: result.ty.clone() });
+        out.push(trunc);
+    } else {
+        // The bits of the double back to a float.
+        let mut bitcast = Op::new("arith.bitcast");
+        bitcast.operands.push(bits);
+        let f64v = l.b.fresh_value(Type::Scalar(crate::ir::ScalarKind::F64));
+        bitcast.results.push(f64v.clone());
+        out.push(bitcast);
+        let mut trunc = Op::new("arith.truncf");
+        trunc.operands.push(f64v);
+        trunc
+            .results
+            .push(Value { id: result.id, ty: result.ty.clone() });
+        out.push(trunc);
+    }
+}
+
+/// The buffer of the formatted arguments: an f64 array, one element per
+/// argument (an empty command has a one-element dummy).
+fn args_buffer(op: &Op, out: &mut Vec<Op>, l: &mut Lowerer) -> (Value, Value) {
+    let n = op.operands.len() as i64;
+    let arr_ty = Type::MemRef {
+        shape: vec![Dim::Static(n.max(1))],
+        elem: Box::new(Type::Scalar(crate::ir::ScalarKind::F64)),
+    };
+    let arr = l.b.fresh_value(arr_ty.clone());
+    let mut alloc = Op::new("memref.alloc");
+    alloc.results.push(arr.clone());
+    out.push(alloc);
+    for (i, arg) in op.operands.iter().enumerate() {
+        let mut cst = Op::new("arith.constant");
+        cst.attrs.push(("value".into(), Attr::Int(i as i64)));
+        let iv = l.b.fresh_value(Type::Index);
+        cst.results.push(iv.clone());
+        out.push(cst);
+        let mut ext = Op::new("arith.sitofp");
+        ext.operands.push(arg.clone());
+        let fv = l.b.fresh_value(Type::Scalar(crate::ir::ScalarKind::F64));
+        ext.results.push(fv.clone());
+        out.push(ext);
+        let mut store = Op::new("memref.store");
+        store.operands = vec![fv, arr.clone(), iv];
+        out.push(store);
+    }
+    let parr = l.pointer(&arr);
+    out.push(parr.clone());
+    let cn = l.const_index(n.max(1));
+    out.push(cn.clone());
+    let pv = parr.results[0].clone();
+    let cv = cn.results[0].clone();
+    (pv, cv)
+}
+
+/// The assertion: the message lives in a string global.
+fn lower_assert(
+    op: Op,
+    used: &mut Vec<&'static str>,
+    out: &mut Vec<Op>,
+    globals: &mut Vec<crate::ir::Global>,
+    counter: &mut usize,
+) {
+    used.push("mlr_assert");
+    let msg = match op.attr("cmd") {
+        Some(Attr::Str(s)) => s.clone(),
+        _ => String::new(),
+    };
+    let cond = op.operands[0].clone();
+    let mut l = Lowerer { b: Builder::new() };
+    let pm = l.string_ptr(globals, counter, &msg, out);
+    // The condition: i1 -> i32.
+    let mut ext = Op::new("arith.extui");
+    ext.operands.push(cond);
+    let c32 = l.b.fresh_value(Type::Scalar(crate::ir::ScalarKind::I32));
+    ext.results.push(c32.clone());
+    out.push(ext);
+    let mut call = Op::new("func.call");
+    call.attrs.push(("callee".into(), Attr::Str("mlr_assert".into())));
+    call.operands = vec![c32, pm];
+    out.push(call);
+}
+
+/// The gradient of the element wise minimum/maximum:
+/// (a, b, dy) -> (da, db).
+fn lower_two_grads(
+    op: Op,
+    used: &mut Vec<&'static str>,
+    out: &mut Vec<Op>,
+    name: &'static str,
+) {
+    used.push(name);
+    #[allow(unused_mut)]
+    let a = op.operands[0].clone();
+    let b = op.operands[1].clone();
+    let dy = op.operands[2].clone();
+    let da = op.results[0].clone();
+    let db = op.results[1].clone();
+    let n = count(&a.ty);
+    let mut l = Lowerer { b: Builder::new() };
+    let mut alloc_of = |v: &Value| -> Op {
+        let ty = match &v.ty {
+            Type::MemRef { .. } => v.ty.clone(),
+            t => t.clone(),
+        };
+        l.alloc(ty, v)
+    };
+    out.push(alloc_of(&da));
+    out.push(alloc_of(&db));
+    let pa = l.pointer(&a);
+    let pb = l.pointer(&b);
+    let pdy = l.pointer(&dy);
+    let pda = l.pointer(&da);
+    let pdb = l.pointer(&db);
+    let cn = l.const_index(n);
+    out.push(pa.clone());
+    out.push(pb.clone());
+    out.push(pdy.clone());
+    out.push(pda.clone());
+    out.push(pdb.clone());
+    out.push(cn.clone());
+    let mut call = Op::new("func.call");
+    call.attrs.push(("callee".into(), Attr::Str(name.to_string())));
+    call.operands = vec![
+        pa.results[0].clone(),
+        pb.results[0].clone(),
+        pdy.results[0].clone(),
+        pda.results[0].clone(),
+        pdb.results[0].clone(),
+        cn.results[0].clone(),
+    ];
+    out.push(call);
+}
+
+/// The gradient of an element wise function with a scalar:
+/// (x, s, dy) -> dx.
+fn lower_scalar_grad(
+    op: Op,
+    used: &mut Vec<&'static str>,
+    out: &mut Vec<Op>,
+    name: &'static str,
+) {
+    used.push(name);
+    let x = op.operands[0].clone();
+    let result = op.results[0].clone();
+    let n = count(&x.ty);
+    let mut l = Lowerer { b: Builder::new() };
+    let out_ty = match &result.ty {
+        Type::MemRef { .. } => result.ty.clone(),
+        t => t.clone(),
+    };
+    out.push(l.alloc(out_ty, &result));
+    let px = l.pointer(&x);
+    let pdx = l.pointer(&result);
+    let cn = l.const_index(n);
+    out.push(px.clone());
+    out.push(pdx.clone());
+    out.push(cn.clone());
+    let mut call = Op::new("func.call");
+    call.attrs.push(("callee".into(), Attr::Str(name.to_string())));
+    call.operands = vec![px.results[0].clone()];
+    let last = op.operands.len() - 1; // the incoming gradient
+    call.operands.extend(op.operands[1..last].iter().cloned());
+    // The gradient of a tensor function is a tensor (its address is passed);
+    // the gradient of a reduction is a scalar.
+    if matches!(op.operands[last].ty, Type::MemRef { .. }) {
+        let pdy = l.pointer(&op.operands[last]);
+        out.push(pdy.clone());
+        call.operands.push(pdy.results[0].clone());
+    } else {
+        call.operands.push(op.operands[last].clone());
+    }
+    call.operands.push(pdx.results[0].clone());
+    call.operands.push(cn.results[0].clone());
+    out.push(call);
+}
+
+/// The gradient of a one-argument element wise function:
+/// (x, dy) -> dx.
+
+/// The gradient of the L2 norm: (x, norm, dy) -> dx.
+fn lower_norm2_grad(op: Op, used: &mut Vec<&'static str>, out: &mut Vec<Op>) {
+    used.push("mlr_norm2_grad");
+    let x = op.operands[0].clone();
+    let norm = op.operands[1].clone();
+    let dy = op.operands[2].clone();
+    let result = op.results[0].clone();
+    let n = count(&x.ty);
+    let mut l = Lowerer { b: Builder::new() };
+    let out_ty = match &result.ty {
+        Type::MemRef { .. } => result.ty.clone(),
+        t => t.clone(),
+    };
+    out.push(l.alloc(out_ty, &result));
+    let px = l.pointer(&x);
+    let pdx = l.pointer(&result);
+    let cn = l.const_index(n);
+    out.push(px.clone());
+    out.push(pdx.clone());
+    out.push(cn.clone());
+    let mut call = Op::new("func.call");
+    call
+        .attrs
+        .push(("callee".into(), Attr::Str("mlr_norm2_grad".into())));
+    call.operands = vec![
+        px.results[0].clone(),
+        norm,
+        dy,
+        pdx.results[0].clone(),
+        cn.results[0].clone(),
+    ];
+    out.push(call);
+}
+
+/// The gradient of the inner product: (a, b, dy) -> (da, db).
+fn lower_dot_grad(op: Op, used: &mut Vec<&'static str>, out: &mut Vec<Op>) {
+    used.push("mlr_scale_fill");
+    #[allow(unused_mut)]
+    let a = op.operands[0].clone();
+    let b = op.operands[1].clone();
+    let dy = op.operands[2].clone();
+    let da = op.results[0].clone();
+    let db = op.results[1].clone();
+    let n = count(&a.ty);
+    let mut l = Lowerer { b: Builder::new() };
+    let mut alloc_of = |v: &Value| -> Op {
+        let ty = match &v.ty {
+            Type::MemRef { .. } => v.ty.clone(),
+            t => t.clone(),
+        };
+        l.alloc(ty, v)
+    };
+    out.push(alloc_of(&da));
+    out.push(alloc_of(&db));
+    let pb = l.pointer(&b);
+    let pa = l.pointer(&a);
+    let pda = l.pointer(&da);
+    let pdb = l.pointer(&db);
+    let cn = l.const_index(n);
+    out.push(pb.clone());
+    out.push(pda.clone());
+    out.push(cn.clone());
+    out.push(pa.clone());
+    out.push(pdb.clone());
+    out.push(cn.clone());
+    let mut call1 = Op::new("func.call");
+    call1
+        .attrs
+        .push(("callee".into(), Attr::Str("mlr_scale_fill".into())));
+    call1.operands = vec![
+        pb.results[0].clone(),
+        dy.clone(),
+        pda.results[0].clone(),
+        cn.results[0].clone(),
+    ];
+    out.push(call1);
+    let mut call2 = Op::new("func.call");
+    call2
+        .attrs
+        .push(("callee".into(), Attr::Str("mlr_scale_fill".into())));
+    call2.operands = vec![
+        pa.results[0].clone(),
+        dy,
+        pdb.results[0].clone(),
+        cn.results[0].clone(),
+    ];
+    out.push(call2);
+}
+
+/// The gradient of the concatenation: (dy) -> (da, db); the ranges come
+/// from the shapes of the operands of the forward operation, which the
+/// backward operation carries in its attributes.
+fn lower_concat_grad(op: Op, used: &mut Vec<&'static str>, out: &mut Vec<Op>) {
+    used.push("mlr_concat_grad");
+    let dy = op.operands[0].clone();
+    let da = op.results[0].clone();
+    let db = op.results[1].clone();
+    let d = dims(&dy.ty);
+    let rowsize: i64 = d[1..].iter().product();
+    let counta = dims(&da.ty)[0];
+    let countb = dims(&db.ty)[0];
+    let mut l = Lowerer { b: Builder::new() };
+    let mut alloc_of = |v: &Value| -> Op {
+        let ty = match &v.ty {
+            Type::MemRef { .. } => v.ty.clone(),
+            t => t.clone(),
+        };
+        l.alloc(ty, v)
+    };
+    out.push(alloc_of(&da));
+    out.push(alloc_of(&db));
+    let pdy = l.pointer(&dy);
+    let pda = l.pointer(&da);
+    let pdb = l.pointer(&db);
+    let ca = l.const_index(counta);
+    let cb = l.const_index(countb);
+    let cs = l.const_index(rowsize);
+    out.push(pdy.clone());
+    out.push(pda.clone());
+    out.push(pdb.clone());
+    out.push(ca.clone());
+    out.push(cb.clone());
+    out.push(cs.clone());
+    let mut call = Op::new("func.call");
+    call
+        .attrs
+        .push(("callee".into(), Attr::Str("mlr_concat_grad".into())));
+    call.operands = vec![
+        pdy.results[0].clone(),
+        ca.results[0].clone(),
+        cb.results[0].clone(),
+        pda.results[0].clone(),
+        pdb.results[0].clone(),
+        cs.results[0].clone(),
+    ];
+    out.push(call);
+}
+
+/// The gradient of the rows: (dy, start, count) -> dx; the number of the
+/// rows of the full tensor comes from the attribute.
+fn lower_rows_grad(op: Op, used: &mut Vec<&'static str>, out: &mut Vec<Op>) {
+    used.push("mlr_rows_grad");
+    let dy = op.operands[0].clone();
+    let start = op.operands[1].clone();
+    let count = op.operands[2].clone();
+    let result = op.results[0].clone();
+    let d = dims(&result.ty);
+    let rowsize: i64 = d[1..].iter().product::<i64>().max(1);
+    let rows = d[0];
+    let mut l = Lowerer { b: Builder::new() };
+    let out_ty = match &result.ty {
+        Type::MemRef { .. } => result.ty.clone(),
+        t => t.clone(),
+    };
+    out.push(l.alloc(out_ty, &result));
+    let pdy = l.pointer(&dy);
+    let pdx = l.pointer(&result);
+    let cr = l.const_index(rows);
+    let cs = l.const_index(rowsize);
+    out.push(pdy.clone());
+    out.push(pdx.clone());
+    out.push(cr.clone());
+    out.push(cs.clone());
+    let mut call = Op::new("func.call");
+    call
+        .attrs
+        .push(("callee".into(), Attr::Str("mlr_rows_grad".into())));
+    call.operands = vec![
+        pdy.results[0].clone(),
+        start,
+        count,
+        pdx.results[0].clone(),
+        cr.results[0].clone(),
+        cs.results[0].clone(),
+    ];
+    out.push(call);
+}
+
+// ───────── the creation and the randomness (M2) ─────────
+
+/// The result buffer and its element count, pushed to `out`.
+fn result_buffer(op: &Op, l: &mut Lowerer, out: &mut Vec<Op>) -> (Value, Value) {
+    let result = op.results[0].clone();
+    let n = count(&result.ty);
+    let out_ty = match &result.ty {
+        Type::MemRef { .. } => result.ty.clone(),
+        t => t.clone(),
+    };
+    let alloc = l.alloc(out_ty, &result);
+    out.push(alloc);
+    let pout = l.pointer(&result);
+    out.push(pout.clone());
+    let cn = l.const_index(n);
+    out.push(cn.clone());
+    let pv = pout.results[0].clone();
+    let cv = cn.results[0].clone();
+    (pv, cv)
+}
+
+/// iota(n): the integers 0..n-1.
+fn lower_iota(op: Op, used: &mut Vec<&'static str>, out: &mut Vec<Op>) {
+    used.push("mlr_iota");
+    let n = op.operands[0].clone();
+    let mut l = Lowerer { b: Builder::new() };
+    let (pout, _cn) = result_buffer(&op, &mut l, out);
+    let mut call = Op::new("func.call");
+    call.attrs.push(("callee".into(), Attr::Str("mlr_iota".into())));
+    call.operands = vec![pout, n];
+    out.push(call);
+}
+
+/// linspace(a, b, n): the n values from a to b.
+fn lower_linspace(op: Op, used: &mut Vec<&'static str>, out: &mut Vec<Op>) {
+    used.push("mlr_linspace");
+    let a = op.operands[0].clone();
+    let b = op.operands[1].clone();
+    let n = op.operands[2].clone();
+    let mut l = Lowerer { b: Builder::new() };
+    let (pout, _cn) = result_buffer(&op, &mut l, out);
+    let mut call = Op::new("func.call");
+    call
+        .attrs
+        .push(("callee".into(), Attr::Str("mlr_linspace".into())));
+    call.operands = vec![a, b, n, pout];
+    out.push(call);
+}
+
+/// onehot(ids, vocab): the one-hot matrix.
+fn lower_onehot(op: Op, used: &mut Vec<&'static str>, out: &mut Vec<Op>) {
+    used.push("mlr_onehot");
+    let ids = op.operands[0].clone();
+    let vocab = op.operands[1].clone();
+    let mut l = Lowerer { b: Builder::new() };
+    let (pout, _cvocab) = result_buffer(&op, &mut l, out);
+    let count = match &op.results[0].ty {
+        Type::Tensor { shape, .. } | Type::MemRef { shape, .. } => match shape[0] {
+            Dim::Static(v) => v,
+            Dim::Dynamic => 0,
+        },
+        _ => 0,
+    };
+    let mut ccount = Op::new("arith.constant");
+    ccount.attrs.push(("value".into(), Attr::Int(count)));
+    let ccount_v = l.b.fresh_value(Type::Scalar(crate::ir::ScalarKind::I32));
+    ccount.results.push(ccount_v.clone());
+    out.push(ccount);
+    let pids = l.pointer(&ids);
+    out.push(pids.clone());
+    let mut call = Op::new("func.call");
+    call.attrs.push(("callee".into(), Attr::Str("mlr_onehot".into())));
+    call.operands = vec![
+        pids.results[0].clone(),
+        pout,
+        ccount_v,
+        vocab,
+    ];
+    out.push(call);
+}
+
+/// The random tensors: (seed, a, b) -> the tensor.
+fn lower_rand(op: Op, used: &mut Vec<&'static str>, out: &mut Vec<Op>, name: &'static str) {
+    used.push(name);
+    let seed = op.operands[0].clone();
+    let a = op.operands[1].clone();
+    let b = op.operands[2].clone();
+    let mut l = Lowerer { b: Builder::new() };
+    let (pout, cn) = result_buffer(&op, &mut l, out);
+    let mut call = Op::new("func.call");
+    call.attrs.push(("callee".into(), Attr::Str(name.to_string())));
+    call.operands = vec![pout, seed, a, b, cn];
+    out.push(call);
+}
+
+/// rand_permutation(n, seed) -> the indices.
+fn lower_rand_permutation(op: Op, used: &mut Vec<&'static str>, out: &mut Vec<Op>) {
+    used.push("mlr_rand_permutation");
+    let n = op.operands[0].clone();
+    let seed = op.operands[1].clone();
+    let mut l = Lowerer { b: Builder::new() };
+    let (pout, _cn) = result_buffer(&op, &mut l, out);
+    let mut call = Op::new("func.call");
+    call
+        .attrs
+        .push(("callee".into(), Attr::Str("mlr_rand_permutation".into())));
+    call.operands = vec![pout, seed, n];
+    out.push(call);
+}
+
+/// gather(t, idx): the selected rows.
+fn lower_gather(op: Op, used: &mut Vec<&'static str>, out: &mut Vec<Op>) {
+    used.push("mlr_gather");
+    let t = op.operands[0].clone();
+    let idx = op.operands[1].clone();
+    let result = op.results[0].clone();
+    let dt = dims(&t.ty);
+    let rowsize: i64 = dt[1..].iter().product::<i64>().max(1);
+    let rows = dt[0];
+    let dcount = dims(&idx.ty);
+    let count = dcount[0];
+    let mut l = Lowerer { b: Builder::new() };
+    let out_ty = match &result.ty {
+        Type::MemRef { .. } => result.ty.clone(),
+        t2 => t2.clone(),
+    };
+    out.push(l.alloc(out_ty, &result));
+    let pt = l.pointer(&t);
+    let pidx = l.pointer(&idx);
+    let pout = l.pointer(&result);
+    let crows = l.const_index(rows);
+    let ccount = l.const_index(count);
+    let csize = l.const_index(rowsize);
+    out.push(pt.clone());
+    out.push(pidx.clone());
+    out.push(pout.clone());
+    out.push(crows.clone());
+    out.push(ccount.clone());
+    out.push(csize.clone());
+    let mut call = Op::new("func.call");
+    call.attrs.push(("callee".into(), Attr::Str("mlr_gather".into())));
+    call.operands = vec![
+        pt.results[0].clone(),
+        pidx.results[0].clone(),
+        pout.results[0].clone(),
+        crows.results[0].clone(),
+        ccount.results[0].clone(),
+        csize.results[0].clone(),
+    ];
+    out.push(call);
+}
+
+/// The gradient of the gather: (t_shape, idx, dy) -> dtable.
+fn lower_gather_grad(op: Op, used: &mut Vec<&'static str>, out: &mut Vec<Op>) {
+    used.push("mlr_gather_grad");
+    let idx = op.operands[1].clone();
+    let dy = op.operands[2].clone();
+    let result = op.results[0].clone();
+    let dcount = dims(&idx.ty);
+    let count = dcount[0];
+    let ddy = dims(&dy.ty);
+    let rowsize: i64 = ddy[1..].iter().product::<i64>().max(1);
+    let dres = dims(&result.ty);
+    let rows = dres[0];
+    let mut l = Lowerer { b: Builder::new() };
+    let out_ty = match &result.ty {
+        Type::MemRef { .. } => result.ty.clone(),
+        t => t.clone(),
+    };
+    out.push(l.alloc(out_ty, &result));
+    let pidx = l.pointer(&idx);
+    let pdy = l.pointer(&dy);
+    let pout = l.pointer(&result);
+    let crows = l.const_index(rows);
+    let ccount = l.const_index(count);
+    let csize = l.const_index(rowsize);
+    out.push(pidx.clone());
+    out.push(pdy.clone());
+    out.push(pout.clone());
+    out.push(crows.clone());
+    out.push(ccount.clone());
+    out.push(csize.clone());
+    let mut call = Op::new("func.call");
+    call
+        .attrs
+        .push(("callee".into(), Attr::Str("mlr_gather_grad".into())));
+    call.operands = vec![
+        pidx.results[0].clone(),
+        pdy.results[0].clone(),
+        pout.results[0].clone(),
+        crows.results[0].clone(),
+        ccount.results[0].clone(),
+        csize.results[0].clone(),
+    ];
+    out.push(call);
+}
+
+/// The dropout: (x, seed, rate) -> (out, mask).
+fn lower_dropout(op: Op, used: &mut Vec<&'static str>, out: &mut Vec<Op>) {
+    used.push("mlr_dropout");
+    let x = op.operands[0].clone();
+    let seed = op.operands[1].clone();
+    let rate = op.operands[2].clone();
+    let result = op.results[0].clone();
+    let n = count(&x.ty);
+    let mut l = Lowerer { b: Builder::new() };
+    let out_ty = match &result.ty {
+        Type::MemRef { .. } => result.ty.clone(),
+        t => t.clone(),
+    };
+    out.push(l.alloc(out_ty, &result));
+    let px = l.pointer(&x);
+    let pout = l.pointer(&result);
+    let cn = l.const_index(n);
+    out.push(px.clone());
+    out.push(pout.clone());
+    out.push(cn.clone());
+    let mut call = Op::new("func.call");
+    call.attrs.push(("callee".into(), Attr::Str("mlr_dropout".into())));
+    call.operands = vec![
+        px.results[0].clone(),
+        seed,
+        rate,
+        pout.results[0].clone(),
+        cn.results[0].clone(),
+    ];
+    out.push(call);
+}
+
+/// The gradient of the dropout: (mask, dy) -> dx.
+fn lower_dropout_grad(op: Op, used: &mut Vec<&'static str>, out: &mut Vec<Op>) {
+    used.push("mlr_dropout_grad");
+    let x = op.operands[0].clone();
+    let dy = op.operands[1].clone();
+    let seed = op.operands[2].clone();
+    let rate = op.operands[3].clone();
+    let result = op.results[0].clone();
+    let n = count(&result.ty);
+    let mut l = Lowerer { b: Builder::new() };
+    let out_ty = match &result.ty {
+        Type::MemRef { .. } => result.ty.clone(),
+        t => t.clone(),
+    };
+    out.push(l.alloc(out_ty, &result));
+    let px = l.pointer(&x);
+    let pdy = l.pointer(&dy);
+    let pdx = l.pointer(&result);
+    let cn = l.const_index(n);
+    out.push(px.clone());
+    out.push(pdy.clone());
+    out.push(pdx.clone());
+    out.push(cn.clone());
+    let mut call = Op::new("func.call");
+    call
+        .attrs
+        .push(("callee".into(), Attr::Str("mlr_dropout_grad".into())));
+    call.operands = vec![
+        px.results[0].clone(),
+        pdy.results[0].clone(),
+        seed,
+        rate,
+        pdx.results[0].clone(),
+        cn.results[0].clone(),
+    ];
+    out.push(call);
+}
+
+/// The accuracy of the logits: (logits, labels) -> f32.
+fn lower_accuracy(op: Op, used: &mut Vec<&'static str>, out: &mut Vec<Op>) {
+    used.push("mlr_accuracy");
+    let logits = op.operands[0].clone();
+    let labels = op.operands[1].clone();
+    let result = op.results[0].clone();
+    let d = dims(&logits.ty);
+    let (rows, vocab) = (d[0], d[1]);
+    let mut l = Lowerer { b: Builder::new() };
+    let pl = l.pointer(&logits);
+    let py = l.pointer(&labels);
+    let crows = l.const_index(rows);
+    let cvocab = l.const_index(vocab);
+    out.push(pl.clone());
+    out.push(py.clone());
+    out.push(crows.clone());
+    out.push(cvocab.clone());
+    let mut call = Op::new("func.call");
+    call.attrs.push(("callee".into(), Attr::Str("mlr_accuracy".into())));
+    call.operands = vec![
+        pl.results[0].clone(),
+        py.results[0].clone(),
+        crows.results[0].clone(),
+        cvocab.results[0].clone(),
+    ];
+    call.results.push(result);
+    out.push(call);
+}
+
+/// The tensor variant: the numbers of the output fill the result buffer.
+fn lower_exec_tensor(
+    op: Op,
+    used: &mut Vec<&'static str>,
+    out: &mut Vec<Op>,
+    globals: &mut Vec<crate::ir::Global>,
+    counter: &mut usize,
+) {
+    used.push("mlr_exec_tensor");
+    let cmd = match op.attr("cmd") {
+        Some(Attr::Str(s)) => s.clone(),
+        _ => String::new(),
+    };
+    let result = op.results[0].clone();
+    let count = count(&result.ty);
+    let mut l = Lowerer { b: Builder::new() };
+    let pc = l.string_ptr(globals, counter, &cmd, out);
+    let (parr, cn) = args_buffer(&op, out, &mut l);
+    let out_ty = match &result.ty {
+        Type::MemRef { .. } => result.ty.clone(),
+        t => t.clone(),
+    };
+    out.push(l.alloc(out_ty, &result));
+    let pout = l.pointer(&result);
+    out.push(pout.clone());
+    let ccount = l.const_index(count);
+    out.push(ccount.clone());
+    let mut call = Op::new("func.call");
+    call
+        .attrs
+        .push(("callee".into(), Attr::Str("mlr_exec_tensor".into())));
+    call.operands = vec![
+        pc,
+        cn,
+        parr,
+        pout.results[0].clone(),
+        ccount.results[0].clone(),
     ];
     out.push(call);
 }

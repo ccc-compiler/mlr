@@ -13,7 +13,7 @@
 //! Restricted to straight line functions whose operations have a known
 //! adjoint; the checker only accepts `value_and_grad` on such functions.
 
-use crate::ir::{Attr, Builder, FuncOp, Op, Type, Value};
+use crate::ir::{Attr, Builder, Dim, FuncOp, Op, Type, Value};
 use std::collections::HashMap;
 
 /// The operations that have an adjoint, plus the ones that pass through.
@@ -34,7 +34,39 @@ const FORWARD: &[&str] = &[
     "mlr.softmax",
     "mlr.softmax_tri",
     "mlr.add",
+    "mlr.tmin",
+    "mlr.tmax",
+    "mlr.tclamp",
+    "mlr.tpow",
+    "mlr.texp",
+    "mlr.tln",
+    "mlr.mean",
+    "mlr.norm1",
+    "mlr.norm2",
+    "mlr.var",
+    "mlr.std",
+    "mlr.dot",
+    "mlr.reshape",
+    "mlr.concat",
+    "mlr.rows",
+    "mlr.reverse",
+    "mlr.iota",
+    "mlr.linspace",
+    "mlr.onehot",
+    "mlr.gather",
+    "mlr.gather_grad",
+    "mlr.dropout",
     "mlr.map",
+    "arith.addf",
+    "arith.subf",
+    "arith.mulf",
+    "arith.divf",
+    "arith.truncf",
+    "arith.extf",
+    "arith.sitofp",
+    "arith.index_cast",
+    "arith.trunci",
+    "arith.extui",
     "func.return",
 ];
 
@@ -197,6 +229,209 @@ pub fn value_and_grad_of(f: &FuncOp, funcs: &[FuncOp]) -> (FuncOp, Vec<&'static 
                 ops.push(g);
                 accumulate(&mut ops, &mut b, &mut adj, &table, dtable);
             }
+            "mlr.tmin" | "mlr.tmax" if op.operands.len() == 2 => {
+                // The winner of the comparison receives the gradient.
+                let grad = if op.name == "mlr.tmin" {
+                    "mlr.tmin_grad"
+                } else {
+                    "mlr.tmax_grad"
+                };
+                let lhs = op.operands[0].clone();
+                let rhs = op.operands[1].clone();
+                let mut g_op = Op::new(grad);
+                g_op.operands = vec![lhs.clone(), rhs.clone(), dy];
+                let da = b.fresh_value(lhs.ty.clone());
+                let db = b.fresh_value(rhs.ty.clone());
+                g_op.results = vec![da.clone(), db.clone()];
+                ops.push(g_op);
+                accumulate(&mut ops, &mut b, &mut adj, &lhs, da);
+                accumulate(&mut ops, &mut b, &mut adj, &rhs, db);
+            }
+            "mlr.tmax" | "mlr.tmin" => {
+                // The reduction to one value: the largest (smallest) element
+                // receives the gradient.
+                let x = op.operands[0].clone();
+                let grad = if op.name == "mlr.tmax" {
+                    "mlr.tmax_grad_value"
+                } else {
+                    "mlr.tmin_grad_value"
+                };
+                let mut g_op = Op::new(grad);
+                g_op.operands = vec![x.clone(), dy];
+                let dx = b.fresh_value(x.ty.clone());
+                g_op.results = vec![dx.clone()];
+                ops.push(g_op);
+                accumulate(&mut ops, &mut b, &mut adj, &x, dx);
+            }
+            "mlr.tclamp" => {
+                let x = op.operands[0].clone();
+                let mut g_op = Op::new("mlr.tclamp_grad");
+                g_op.operands = vec![x.clone(), op.operands[1].clone(), op.operands[2].clone(), dy];
+                let dx = b.fresh_value(x.ty.clone());
+                g_op.results = vec![dx.clone()];
+                ops.push(g_op);
+                accumulate(&mut ops, &mut b, &mut adj, &x, dx);
+            }
+            "mlr.tpow" => {
+                let x = op.operands[0].clone();
+                let mut g_op = Op::new("mlr.tpow_grad");
+                g_op.operands = vec![x.clone(), op.operands[1].clone(), dy];
+                let dx = b.fresh_value(x.ty.clone());
+                g_op.results = vec![dx.clone()];
+                ops.push(g_op);
+                accumulate(&mut ops, &mut b, &mut adj, &x, dx);
+            }
+            "mlr.texp" | "mlr.tln" => {
+                let x = op.operands[0].clone();
+                let grad = if op.name == "mlr.texp" {
+                    "mlr.texp_grad"
+                } else {
+                    "mlr.tln_grad"
+                };
+                let mut g_op = Op::new(grad);
+                g_op.operands = vec![x.clone(), dy];
+                let dx = b.fresh_value(x.ty.clone());
+                g_op.results = vec![dx.clone()];
+                ops.push(g_op);
+                accumulate(&mut ops, &mut b, &mut adj, &x, dx);
+            }
+            "mlr.mean" => {
+                // The gradient of the mean is the gradient of the sum with
+                // the seed divided by the number of the elements.
+                used.push("mlr_sum_grad");
+                let x = op.operands[0].clone();
+                let n = match &x.ty {
+                    Type::Tensor { shape, .. } | Type::MemRef { shape, .. } => shape
+                        .iter()
+                        .fold(1i64, |acc, d| match d {
+                            Dim::Static(v) => acc * v,
+                            Dim::Dynamic => acc,
+                        }),
+                    _ => 1,
+                };
+                let mut cst = Op::new("arith.constant");
+                cst.attrs.push(("value".into(), Attr::Float(n as f64)));
+                let cval = b.fresh_value(Type::Scalar(crate::ir::ScalarKind::F32));
+                cst.results.push(cval.clone());
+                ops.push(cst);
+                let mut div = Op::new("arith.divf");
+                div.operands = vec![dy, cval.clone()];
+                let seed = b.fresh_value(Type::Scalar(crate::ir::ScalarKind::F32));
+                div.results.push(seed.clone());
+                ops.push(div);
+                let mut g_op = Op::new("mlr.sum_grad");
+                g_op.operands = vec![x.clone(), seed];
+                let dx = b.fresh_value(x.ty.clone());
+                g_op.results = vec![dx.clone()];
+                ops.push(g_op);
+                accumulate(&mut ops, &mut b, &mut adj, &x, dx);
+            }
+            "mlr.norm1" => {
+                let x = op.operands[0].clone();
+                let mut g_op = Op::new("mlr.norm1_grad");
+                g_op.operands = vec![x.clone(), dy];
+                let dx = b.fresh_value(x.ty.clone());
+                g_op.results = vec![dx.clone()];
+                ops.push(g_op);
+                accumulate(&mut ops, &mut b, &mut adj, &x, dx);
+            }
+            "mlr.norm2" => {
+                let x = op.operands[0].clone();
+                let mut g_op = Op::new("mlr.norm2_grad");
+                g_op.operands = vec![x.clone(), y.clone(), dy];
+                let dx = b.fresh_value(x.ty.clone());
+                g_op.results = vec![dx.clone()];
+                ops.push(g_op);
+                accumulate(&mut ops, &mut b, &mut adj, &x, dx);
+            }
+            "mlr.var" | "mlr.std" => {
+                let x = op.operands[0].clone();
+                let grad = if op.name == "mlr.var" {
+                    "mlr.var_grad"
+                } else {
+                    "mlr.std_grad"
+                };
+                let mut g_op = Op::new(grad);
+                g_op.operands = vec![x.clone(), dy];
+                let dx = b.fresh_value(x.ty.clone());
+                g_op.results = vec![dx.clone()];
+                ops.push(g_op);
+                accumulate(&mut ops, &mut b, &mut adj, &x, dx);
+            }
+            "mlr.dot" => {
+                let lhs = op.operands[0].clone();
+                let rhs = op.operands[1].clone();
+                let mut g_op = Op::new("mlr.dot_grad");
+                g_op.operands = vec![lhs.clone(), rhs.clone(), dy];
+                let da = b.fresh_value(lhs.ty.clone());
+                let db = b.fresh_value(rhs.ty.clone());
+                g_op.results = vec![da.clone(), db.clone()];
+                ops.push(g_op);
+                accumulate(&mut ops, &mut b, &mut adj, &lhs, da);
+                accumulate(&mut ops, &mut b, &mut adj, &rhs, db);
+            }
+            "mlr.reshape" => {
+                // The inverse of the reshape is a copy of the original shape.
+                used.push("mlr_copy");
+                let x = op.operands[0].clone();
+                let mut g_op = Op::new("mlr.reshape_grad");
+                g_op.operands = vec![dy];
+                let dx = b.fresh_value(x.ty.clone());
+                g_op.results = vec![dx.clone()];
+                ops.push(g_op);
+                accumulate(&mut ops, &mut b, &mut adj, &x, dx);
+            }
+            "mlr.concat" => {
+                let lhs = op.operands[0].clone();
+                let rhs = op.operands[1].clone();
+                let mut g_op = Op::new("mlr.concat_grad");
+                g_op.operands = vec![dy];
+                let da = b.fresh_value(lhs.ty.clone());
+                let db = b.fresh_value(rhs.ty.clone());
+                g_op.results = vec![da.clone(), db.clone()];
+                ops.push(g_op);
+                accumulate(&mut ops, &mut b, &mut adj, &lhs, da);
+                accumulate(&mut ops, &mut b, &mut adj, &rhs, db);
+            }
+            "mlr.rows" => {
+                let x = op.operands[0].clone();
+                let mut g_op = Op::new("mlr.rows_grad");
+                g_op.operands = vec![
+                    dy,
+                    op.operands[1].clone(),
+                    op.operands[2].clone(),
+                ];
+                let dx = b.fresh_value(x.ty.clone());
+                g_op.results = vec![dx.clone()];
+                ops.push(g_op);
+                accumulate(&mut ops, &mut b, &mut adj, &x, dx);
+            }
+            "mlr.dropout" => {
+                // The mask is recomputed from the same seed and rate.
+                used.push("mlr_dropout_grad");
+                let x = op.operands[0].clone();
+                let mut g_op = Op::new("mlr.dropout_grad");
+                g_op.operands = vec![
+                    x.clone(),
+                    dy,
+                    op.operands[1].clone(),
+                    op.operands[2].clone(),
+                ];
+                let dx = b.fresh_value(x.ty.clone());
+                g_op.results = vec![dx.clone()];
+                ops.push(g_op);
+                accumulate(&mut ops, &mut b, &mut adj, &x, dx);
+            }
+            "mlr.reverse" => {
+                // The reverse is its own inverse.
+                let x = op.operands[0].clone();
+                let mut g_op = Op::new("mlr.reverse");
+                g_op.operands = vec![dy];
+                let dx = b.fresh_value(x.ty.clone());
+                g_op.results = vec![dx.clone()];
+                ops.push(g_op);
+                accumulate(&mut ops, &mut b, &mut adj, &x, dx);
+            }
             "mlr.layernorm" => {
                 // dx, dg and db; the statistics are recomputed from x.
                 used.push("mlr_layernorm_grad");
@@ -292,6 +527,80 @@ pub fn value_and_grad_of(f: &FuncOp, funcs: &[FuncOp]) -> (FuncOp, Vec<&'static 
                 accumulate(&mut ops, &mut b, &mut adj, &logits, dlogits);
             }
             "arith.constant" => {}
+            // The scalar arithmetic on the way to the loss: the adjoints
+            // are the usual ones, expressed with scalar operations.
+            "arith.addf" => {
+                let lhs = op.operands[0].clone();
+                let rhs = op.operands[1].clone();
+                accumulate(&mut ops, &mut b, &mut adj, &lhs, dy.clone());
+                accumulate(&mut ops, &mut b, &mut adj, &rhs, dy);
+            }
+            "arith.subf" => {
+                let lhs = op.operands[0].clone();
+                let rhs = op.operands[1].clone();
+                accumulate(&mut ops, &mut b, &mut adj, &lhs, dy.clone());
+                let mut neg = Op::new("arith.negf");
+                neg.operands = vec![dy];
+                let ndy = b.fresh_value(Type::Scalar(crate::ir::ScalarKind::F32));
+                neg.results.push(ndy.clone());
+                ops.push(neg);
+                accumulate(&mut ops, &mut b, &mut adj, &rhs, ndy);
+            }
+            "arith.mulf" => {
+                let lhs = op.operands[0].clone();
+                let rhs = op.operands[1].clone();
+                let mut pa = Op::new("arith.mulf");
+                pa.operands = vec![dy.clone(), rhs.clone()];
+                let pva = b.fresh_value(Type::Scalar(crate::ir::ScalarKind::F32));
+                pa.results.push(pva.clone());
+                ops.push(pa);
+                let mut pb = Op::new("arith.mulf");
+                pb.operands = vec![dy.clone(), lhs.clone()];
+                let pvb = b.fresh_value(Type::Scalar(crate::ir::ScalarKind::F32));
+                pb.results.push(pvb.clone());
+                ops.push(pb);
+                accumulate(&mut ops, &mut b, &mut adj, &lhs, pva);
+                accumulate(&mut ops, &mut b, &mut adj, &rhs, pvb);
+            }
+            "arith.divf" => {
+                let lhs = op.operands[0].clone();
+                let rhs = op.operands[1].clone();
+                let mut da = Op::new("arith.divf");
+                da.operands = vec![dy.clone(), rhs.clone()];
+                let dva = b.fresh_value(Type::Scalar(crate::ir::ScalarKind::F32));
+                da.results.push(dva.clone());
+                ops.push(da);
+                accumulate(&mut ops, &mut b, &mut adj, &lhs, dva);
+                let mut aa = Op::new("arith.mulf");
+                aa.operands = vec![dy.clone(), lhs.clone()];
+                let t = b.fresh_value(Type::Scalar(crate::ir::ScalarKind::F32));
+                aa.results.push(t.clone());
+                ops.push(aa);
+                let mut bb = Op::new("arith.mulf");
+                bb.operands = vec![rhs.clone(), rhs.clone()];
+                let b2v = b.fresh_value(Type::Scalar(crate::ir::ScalarKind::F32));
+                bb.results.push(b2v.clone());
+                ops.push(bb);
+                let mut db = Op::new("arith.divf");
+                db.operands = vec![t, b2v];
+                let ndy = b.fresh_value(Type::Scalar(crate::ir::ScalarKind::F32));
+                db.results.push(ndy.clone());
+                ops.push(db);
+                let mut neg = Op::new("arith.negf");
+                neg.operands = vec![ndy];
+                let nndy = b.fresh_value(Type::Scalar(crate::ir::ScalarKind::F32));
+                neg.results.push(nndy.clone());
+                ops.push(neg);
+                accumulate(&mut ops, &mut b, &mut adj, &rhs, nndy);
+            }
+            // The conversions of the scalars pass the gradient through.
+            "arith.truncf" | "arith.extf" | "arith.sitofp" | "arith.index_cast"
+            | "arith.trunci" | "arith.extui" => {
+                if let Some(a) = op.operands.first() {
+                    let a = a.clone();
+                    accumulate(&mut ops, &mut b, &mut adj, &a, dy);
+                }
+            }
             other => panic!(
                 "value_and_grad: the operation `{}` has no gradient yet",
                 other

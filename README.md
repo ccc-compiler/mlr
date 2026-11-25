@@ -154,6 +154,7 @@ See [doc/mlr.md](doc/mlr.md) for the details.
   pipeline
 * [doc/struct.md](doc/struct.md) — the design of the struct types
 * [doc/train.md](doc/train.md) — the design of the training (backpropagation)
+* [doc/lib.md](doc/lib.md) — the design of the standard library (math, tensors, randomness, the shell bridge)
 
 ## Layout
 

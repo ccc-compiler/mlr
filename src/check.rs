@@ -126,6 +126,32 @@ pub enum DomainOp {
     SoftmaxTri,
     Sum,
     Add,
+    Tmin,
+    Tmax,
+    Tclamp,
+    Tpow,
+    Texp,
+    Tln,
+    Mean,
+    ArgMin,
+    Norm1,
+    Norm2,
+    Var,
+    Std,
+    Dot,
+    Reshape,
+    Concat,
+    Rows,
+    Reverse,
+    Iota,
+    Linspace,
+    Onehot,
+    RandUniform,
+    RandNormal,
+    RandPermutation,
+    Gather,
+    Dropout,
+    Accuracy,
     Conv2d,
     MaxPool2d,
     Relu,
@@ -150,6 +176,32 @@ impl DomainOp {
             DomainOp::SoftmaxTri => "softmax_tri",
             DomainOp::Sum => "sum",
             DomainOp::Add => "add",
+            DomainOp::Tmin => "tmin",
+            DomainOp::Tmax => "tmax",
+            DomainOp::Tclamp => "tclamp",
+            DomainOp::Tpow => "tpow",
+            DomainOp::Texp => "texp",
+            DomainOp::Tln => "tln",
+            DomainOp::Mean => "mean",
+            DomainOp::ArgMin => "argmin",
+            DomainOp::Norm1 => "norm1",
+            DomainOp::Norm2 => "norm2",
+            DomainOp::Var => "var",
+            DomainOp::Std => "std",
+            DomainOp::Dot => "dot",
+            DomainOp::Reshape => "reshape",
+            DomainOp::Concat => "concat",
+            DomainOp::Rows => "rows",
+            DomainOp::Reverse => "reverse",
+            DomainOp::Iota => "iota",
+            DomainOp::Linspace => "linspace",
+            DomainOp::Onehot => "onehot",
+            DomainOp::RandUniform => "rand_uniform",
+            DomainOp::RandNormal => "rand_normal",
+            DomainOp::RandPermutation => "rand_permutation",
+            DomainOp::Gather => "gather",
+            DomainOp::Dropout => "dropout",
+            DomainOp::Accuracy => "accuracy",
             DomainOp::Conv2d => "conv2d",
             DomainOp::MaxPool2d => "maxpool2d",
             DomainOp::Relu => "relu",
@@ -255,6 +307,14 @@ pub enum TExpr {
         fields: Vec<TExpr>,
         ty: CType,
     },
+    /// A system call: `exec`, `exec_i`, `exec_f` or `assert`; the command
+    /// (or the message) is a literal, the arguments are numbers.
+    Sys {
+        kind: SysKind,
+        cmd: String,
+        args: Vec<TExpr>,
+        ty: CType,
+    },
     /// A field of a struct: `recv.field`.
     Field {
         recv: Box<TExpr>,
@@ -289,6 +349,7 @@ impl TExpr {
             TExpr::Domain { ty, .. } => ty.clone(),
             TExpr::Load { ty, .. } => ty.clone(),
             TExpr::Save { .. } => CType::Void,
+            TExpr::Sys { ty, .. } => ty.clone(),
             TExpr::Struct { ty, .. } => ty.clone(),
             TExpr::Field { ty, .. } => ty.clone(),
             TExpr::With { ty, .. } => ty.clone(),
@@ -299,6 +360,16 @@ impl TExpr {
     pub fn span(&self) -> Span {
         Span::default()
     }
+}
+
+/// The kind of a system call.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum SysKind {
+    Exec,
+    ExecI,
+    ExecF,
+    ExecTensor,
+    Assert,
 }
 
 #[derive(Clone, Debug)]
@@ -1786,6 +1857,29 @@ impl Checker {
             "softmax_tri" => DomainOp::SoftmaxTri,
             "sum" => DomainOp::Sum,
             "add" => DomainOp::Add,
+            "tmin" => DomainOp::Tmin,
+            "tmax" => DomainOp::Tmax,
+            "tclamp" => DomainOp::Tclamp,
+            "tpow" => DomainOp::Tpow,
+            "texp" => DomainOp::Texp,
+            "tln" => DomainOp::Tln,
+            "mean" => DomainOp::Mean,
+            "argmin" => DomainOp::ArgMin,
+            "norm1" => DomainOp::Norm1,
+            "norm2" => DomainOp::Norm2,
+            "var" => DomainOp::Var,
+            "std" => DomainOp::Std,
+            "dot" => DomainOp::Dot,
+            "concat" => DomainOp::Concat,
+            "rows" => DomainOp::Rows,
+            "reverse" => DomainOp::Reverse,
+            "iota" => DomainOp::Iota,
+            "linspace" => DomainOp::Linspace,
+            "onehot" => DomainOp::Onehot,
+            "rand_permutation" => DomainOp::RandPermutation,
+            "gather" => DomainOp::Gather,
+            "dropout" => DomainOp::Dropout,
+            "accuracy" => DomainOp::Accuracy,
             "sample" => DomainOp::Sample,
             _ => unreachable!(),
         };
@@ -1952,6 +2046,360 @@ impl Checker {
                     },
                     vec![],
                 )
+            }
+            DomainOp::Tmin | DomainOp::Tmax => {
+                // Two tensors: the element wise minimum/maximum. One tensor:
+                // its largest (smallest) element, as a scalar.
+                if targs.len() == 1 {
+                    let (d, e) = tensor(&targs[0].ty())?;
+                    if e != CType::Scalar(ScalarKind::F32) {
+                        return err(
+                            format!("`{}` expects a tensor of f32, found {}", name, e.print()),
+                            span,
+                        );
+                    }
+                    if d.is_empty() {
+                        return err(format!("`{}` expects a tensor with elements", name), span);
+                    }
+                    return Ok(TExpr::Domain {
+                        op,
+                        args: targs,
+                        params: vec![],
+                        ty: CType::Scalar(ScalarKind::F32),
+                    });
+                }
+                if targs.len() != 2 {
+                    return err(format!("`{}` takes one or two tensors", name), span);
+                }
+                let (da, ea) = tensor(&targs[0].ty())?;
+                let (db, eb) = tensor(&targs[1].ty())?;
+                if ea != CType::Scalar(ScalarKind::F32) || eb != CType::Scalar(ScalarKind::F32) {
+                    return err(format!("`{}` expects tensors of f32", name), span);
+                }
+                if da != db {
+                    return err(
+                        format!("`{}` expects tensors of the same shape", name),
+                        span,
+                    );
+                }
+                (
+                    CType::Tensor {
+                        dims: da.iter().map(|v| CDim::Static(*v)).collect(),
+                        elem: Box::new(CType::Scalar(ScalarKind::F32)),
+                    },
+                    vec![],
+                )
+            }
+            DomainOp::Tclamp | DomainOp::Tpow => {
+                let expected = if name == "tclamp" { 3 } else { 2 };
+                if targs.len() != expected {
+                    return err(format!("`{}` takes {} arguments", name, expected), span);
+                }
+                let (d, e) = tensor(&targs[0].ty())?;
+                if e != CType::Scalar(ScalarKind::F32) {
+                    return err(
+                        format!("`{}` expects a tensor of f32, found {}", name, e.print()),
+                        span,
+                    );
+                }
+                for t in targs[1..].iter_mut() {
+                    if t.ty() != CType::Scalar(ScalarKind::F32) {
+                        *t = TExpr::Cast {
+                            value: Box::new(t.clone()),
+                            from: t.ty(),
+                            to: CType::Scalar(ScalarKind::F32),
+                        };
+                    }
+                }
+                (
+                    CType::Tensor {
+                        dims: d.iter().map(|v| CDim::Static(*v)).collect(),
+                        elem: Box::new(CType::Scalar(ScalarKind::F32)),
+                    },
+                    vec![],
+                )
+            }
+            DomainOp::Texp | DomainOp::Tln | DomainOp::Reverse => {
+                if targs.len() != 1 {
+                    return err(format!("`{}` takes one tensor", name), span);
+                }
+                let (d, e) = tensor(&targs[0].ty())?;
+                if e != CType::Scalar(ScalarKind::F32) {
+                    return err(
+                        format!("`{}` expects a tensor of f32, found {}", name, e.print()),
+                        span,
+                    );
+                }
+                (
+                    CType::Tensor {
+                        dims: d.iter().map(|v| CDim::Static(*v)).collect(),
+                        elem: Box::new(CType::Scalar(ScalarKind::F32)),
+                    },
+                    vec![],
+                )
+            }
+            DomainOp::Mean | DomainOp::Norm1 | DomainOp::Norm2 | DomainOp::Var | DomainOp::Std => {
+                if targs.len() != 1 {
+                    return err(format!("`{}` takes one tensor", name), span);
+                }
+                let (d, e) = tensor(&targs[0].ty())?;
+                if e != CType::Scalar(ScalarKind::F32) {
+                    return err(
+                        format!("`{}` expects a tensor of f32, found {}", name, e.print()),
+                        span,
+                    );
+                }
+                if d.is_empty() {
+                    return err(format!("`{}` expects a tensor with elements", name), span);
+                }
+                (CType::Scalar(ScalarKind::F32), vec![])
+            }
+            DomainOp::ArgMin => {
+                if targs.len() != 1 {
+                    return err("`argmin` takes one tensor", span);
+                }
+                let (d, e) = tensor(&targs[0].ty())?;
+                if e != CType::Scalar(ScalarKind::F32) {
+                    return err(
+                        format!("`argmin` expects a tensor of f32, found {}", e.print()),
+                        span,
+                    );
+                }
+                if d.is_empty() {
+                    return err("`argmin` expects a tensor with elements", span);
+                }
+                (CType::Scalar(ScalarKind::I32), vec![])
+            }
+            DomainOp::Dot => {
+                if targs.len() != 2 {
+                    return err("`dot` takes two tensors", span);
+                }
+                let (da, ea) = tensor(&targs[0].ty())?;
+                let (db, eb) = tensor(&targs[1].ty())?;
+                if ea != CType::Scalar(ScalarKind::F32) || eb != CType::Scalar(ScalarKind::F32) {
+                    return err("`dot` expects tensors of f32", span);
+                }
+                if da != db {
+                    return err("`dot` expects tensors of the same shape", span);
+                }
+                (CType::Scalar(ScalarKind::F32), vec![])
+            }
+            DomainOp::Concat => {
+                if targs.len() != 2 {
+                    return err("`concat` takes two tensors", span);
+                }
+                let (da, ea) = tensor(&targs[0].ty())?;
+                let (db, eb) = tensor(&targs[1].ty())?;
+                if ea != CType::Scalar(ScalarKind::F32) || eb != CType::Scalar(ScalarKind::F32) {
+                    return err("`concat` expects tensors of f32", span);
+                }
+                if da.len() < 2 || da.len() != db.len() || da[1..] != db[1..] {
+                    return err(
+                        "`concat` expects two tensors of the same rank and the same                          shape beyond the first axis"
+                            .to_string(),
+                        span,
+                    );
+                }
+                (
+                    CType::Tensor {
+                        dims: std::iter::once(CDim::Static(da[0] + db[0]))
+                            .chain(da[1..].iter().map(|v| CDim::Static(*v)))
+                            .collect(),
+                        elem: Box::new(CType::Scalar(ScalarKind::F32)),
+                    },
+                    vec![],
+                )
+            }
+            DomainOp::Rows => {
+                if targs.len() != 3 {
+                    return err("`rows` takes a tensor, a start and a count", span);
+                }
+                let (d, e) = row_tensor(&targs[0].ty())?;
+                if d.len() < 1 {
+                    return err("`rows` expects a tensor of rank 1 or more", span);
+                }
+                let start = integer_arg(&mut targs, 1, "the start of `rows`", span)?;
+                let count = integer_arg(&mut targs, 2, "the count of `rows`", span)?;
+                let _ = start;
+                // A literal count gives a static shape.
+                let first = match &count {
+                    TExpr::ConstInt(v, _) => CDim::Static(*v),
+                    _ => CDim::Dynamic,
+                };
+                (
+                    CType::Tensor {
+                        dims: std::iter::once(first)
+                            .chain(d[1..].iter().map(|v| CDim::Static(*v)))
+                            .collect(),
+                        elem: Box::new(e),
+                    },
+                    vec![],
+                )
+            }
+            // Handled by `check_reshape`/`check_call`, which the dispatch
+            // calls directly.
+            DomainOp::Reshape
+            | DomainOp::RandUniform
+            | DomainOp::RandNormal => unreachable!(),
+            DomainOp::Iota => {
+                // iota(n: i32) -> Tensor<nxi32>: a literal n gives a static
+                // shape.
+                if targs.len() != 1 {
+                    return err("`iota` takes the number of the elements", span);
+                }
+                let n = integer_arg(&mut targs, 0, "the count of `iota`", span)?;
+                let dims = match &n {
+                    TExpr::ConstInt(v, _) => vec![CDim::Static(*v)],
+                    _ => vec![CDim::Dynamic],
+                };
+                (
+                    CType::Tensor {
+                        dims,
+                        elem: Box::new(CType::Scalar(ScalarKind::I32)),
+                    },
+                    vec![],
+                )
+            }
+            DomainOp::Linspace => {
+                // linspace(a: f32, b: f32, n: i32) -> Tensor<nxf32>
+                if targs.len() != 3 {
+                    return err("`linspace` takes a start, an end and a count", span);
+                }
+                let start = self.call_f32_scalar(&mut targs, 0, span)?;
+                let end = self.call_f32_scalar(&mut targs, 1, span)?;
+                let _ = (start, end);
+                let n = integer_arg(&mut targs, 2, "the count of `linspace`", span)?;
+                let dims = match &n {
+                    TExpr::ConstInt(v, _) => vec![CDim::Static(*v)],
+                    _ => vec![CDim::Dynamic],
+                };
+                (
+                    CType::Tensor {
+                        dims,
+                        elem: Box::new(CType::Scalar(ScalarKind::F32)),
+                    },
+                    vec![],
+                )
+            }
+            DomainOp::Onehot => {
+                // onehot(ids: Tensor<Mxi32>, vocab: i32) -> Tensor<MxVxf32>;
+                // a literal vocab gives a static shape.
+                if targs.len() != 2 {
+                    return err("`onehot` takes the tokens and the vocabulary size", span);
+                }
+                let (d, e) = row_tensor(&targs[0].ty())?;
+                if e != CType::Scalar(ScalarKind::I32) {
+                    return err(
+                        format!("`onehot` expects a tensor of i32, found {}", e.print()),
+                        span,
+                    );
+                }
+                if d.len() != 1 {
+                    return err("`onehot` expects a tensor of rank 1", span);
+                }
+                let vocab = integer_arg(&mut targs, 1, "the vocabulary size", span)?;
+                let vdim = match &vocab {
+                    TExpr::ConstInt(v, _) => CDim::Static(*v),
+                    _ => CDim::Dynamic,
+                };
+                (
+                    CType::Tensor {
+                        dims: vec![CDim::Static(d[0]), vdim],
+                        elem: Box::new(CType::Scalar(ScalarKind::F32)),
+                    },
+                    vec![],
+                )
+            }
+            DomainOp::RandPermutation => {
+                // rand_permutation(n: i32, seed: i32) -> Tensor<nxi32>
+                if targs.len() != 2 {
+                    return err("`rand_permutation` takes a count and a seed", span);
+                }
+                let n = integer_arg(&mut targs, 0, "the count", span)?;
+                let seed = integer_arg(&mut targs, 1, "the seed", span)?;
+                let _ = seed;
+                let dims = match &n {
+                    TExpr::ConstInt(v, _) => vec![CDim::Static(*v)],
+                    _ => vec![CDim::Dynamic],
+                };
+                (
+                    CType::Tensor {
+                        dims,
+                        elem: Box::new(CType::Scalar(ScalarKind::I32)),
+                    },
+                    vec![],
+                )
+            }
+            DomainOp::Gather => {
+                // gather(t: Tensor<Rx...E>, idx: Tensor<Kxi32>) -> the rows,
+                // with the element type of the tensor.
+                if targs.len() != 2 {
+                    return err("`gather` takes a tensor and the indices", span);
+                }
+                let (d, e) = row_tensor(&targs[0].ty())?;
+                let (di, ei) = row_tensor(&targs[1].ty())?;
+                if ei != CType::Scalar(ScalarKind::I32) {
+                    return err(
+                        format!("`gather` expects indices of i32, found {}", ei.print()),
+                        span,
+                    );
+                }
+                if di.len() != 1 {
+                    return err("`gather` expects the indices as a tensor of rank 1", span);
+                }
+                (
+                    CType::Tensor {
+                        dims: std::iter::once(CDim::Static(di[0]))
+                            .chain(d[1..].iter().map(|v| CDim::Static(*v)))
+                            .collect(),
+                        elem: Box::new(e),
+                    },
+                    vec![],
+                )
+            }
+            DomainOp::Dropout => {
+                // dropout(x: Tensor<...>, seed: i32, rate: f32)
+                if targs.len() != 3 {
+                    return err("`dropout` takes a tensor, a seed and a rate", span);
+                }
+                let (d, e) = tensor(&targs[0].ty())?;
+                if e != CType::Scalar(ScalarKind::F32) {
+                    return err(
+                        format!("`dropout` expects a tensor of f32, found {}", e.print()),
+                        span,
+                    );
+                }
+                let seed = integer_arg(&mut targs, 1, "the seed", span)?;
+                let rate = self.call_f32_scalar(&mut targs, 2, span)?;
+                let _ = (seed, rate);
+                (
+                    CType::Tensor {
+                        dims: d.iter().map(|v| CDim::Static(*v)).collect(),
+                        elem: Box::new(CType::Scalar(ScalarKind::F32)),
+                    },
+                    vec![],
+                )
+            }
+            DomainOp::Accuracy => {
+                // accuracy(logits: Tensor<MxVxf32>, labels: Tensor<Mxi32>) -> f32
+                if targs.len() != 2 {
+                    return err("`accuracy` takes the logits and the labels", span);
+                }
+                let (d, e) = tensor(&targs[0].ty())?;
+                if e != CType::Scalar(ScalarKind::F32) || d.len() != 2 {
+                    return err(
+                        format!("`accuracy` expects the logits as a matrix of f32, found {}", e.print()),
+                        span,
+                    );
+                }
+                let (dl, el) = row_tensor(&targs[1].ty())?;
+                if el != CType::Scalar(ScalarKind::I32) || dl.len() != 1 || dl[0] != d[0] {
+                    return err(
+                        "`accuracy` expects one label per row of the logits".to_string(),
+                        span,
+                    );
+                }
+                (CType::Scalar(ScalarKind::F32), vec![])
             }
             DomainOp::Sum => {
                 // sum(t: Tensor<...xf32>) -> f32
@@ -2347,6 +2795,137 @@ impl Checker {
     }
 
 
+    /// Coerces one argument of a typed list to f32, in place.
+    fn call_f32_scalar(
+        &mut self,
+        targs: &mut [TExpr],
+        index: usize,
+        span: &Span,
+    ) -> Result<TExpr, Error> {
+        let t = targs[index].ty();
+        if !t.is_numeric() {
+            return err(format!("expects a number, found {}", t.print()), span);
+        }
+        if t == CType::Scalar(ScalarKind::F32) {
+            return Ok(targs[index].clone());
+        }
+        let c = TExpr::Cast {
+            value: Box::new(targs[index].clone()),
+            from: t,
+            to: CType::Scalar(ScalarKind::F32),
+        };
+        targs[index] = c.clone();
+        Ok(c)
+    }
+
+    /// A call of a scalar runtime function: every argument is a number,
+    /// coerced to f32, and the result is f32.
+    fn call_f32(&mut self, name: &str, args: &[Expr], span: &Span) -> Result<TExpr, Error> {
+        let mut targs = Vec::new();
+        for a in args {
+            let a = self.check_expr(a)?;
+            let t = a.ty();
+            if !t.is_numeric() {
+                return err(
+                    format!("`{}` expects numbers, found {}", name, t.print()),
+                    span,
+                );
+            }
+            let a = if t == CType::Scalar(ScalarKind::F32) {
+                a
+            } else {
+                TExpr::Cast {
+                    value: Box::new(a),
+                    from: t,
+                    to: CType::Scalar(ScalarKind::F32),
+                }
+            };
+            targs.push(a);
+        }
+        Ok(TExpr::Call {
+            name: format!("mlr_{}", name),
+            type_args: vec![],
+            args: targs,
+            ret: CType::Scalar(ScalarKind::F32),
+        })
+    }
+
+    /// `reshape<Tensor<...>>(x)`: the same elements in a new shape; the
+    /// number of the elements must be the same.
+    fn check_reshape(
+        &mut self,
+        type_args: &[SrcType],
+        args: &[Expr],
+        span: &Span,
+    ) -> Result<TExpr, Error> {
+        if type_args.len() != 1 {
+            return err("`reshape` takes exactly one type argument", span);
+        }
+        if args.len() != 1 {
+            return err("`reshape` takes exactly one tensor", span);
+        }
+        let ty = self.resolve(&type_args[0], span);
+        let a = self.check_expr(&args[0])?;
+        let source = match a.ty().dims() {
+            Some(dims) => {
+                let mut count = 1i64;
+                for dim in dims {
+                    match dim {
+                        CDim::Static(v) => count *= v,
+                        CDim::Dynamic => {
+                            return err(
+                                "`reshape` needs a tensor with static dimensions",
+                                span,
+                            )
+                        }
+                    }
+                }
+                count
+            }
+            None => {
+                return err(
+                    format!("`reshape` expects a tensor, found {}", a.ty().print()),
+                    span,
+                )
+            }
+        };
+        let target = match ty.dims() {
+            Some(dims) => {
+                let mut count = 1i64;
+                for dim in dims {
+                    match dim {
+                        CDim::Static(v) => count *= v,
+                        CDim::Dynamic => {
+                            return err(
+                                "`reshape` needs a type with static dimensions",
+                                span,
+                            )
+                        }
+                    }
+                }
+                count
+            }
+            None => {
+                return err("`reshape` expects a tensor type", span);
+            }
+        };
+        if source != target {
+            return err(
+                format!(
+                    "`reshape` cannot turn {} elements into {}",
+                    source, target
+                ),
+                span,
+            );
+        }
+        Ok(TExpr::Domain {
+            op: DomainOp::Reshape,
+            args: vec![a],
+            params: vec![],
+            ty,
+        })
+    }
+
     /// `cross_entropy(logits, labels)`: the mean cross entropy of the rows;
     /// the labels are integers, so the arguments are checked here and not by
     /// the shared tensor rules.
@@ -2470,6 +3049,181 @@ impl Checker {
                     return err("`mlr.load` expects a tensor type", span);
                 }
                 return Ok(TExpr::Load { path, key, ty });
+            }
+            "exec_tensor" => {
+                if type_args.len() != 1 {
+                    return err("`exec_tensor` takes exactly one type argument", span);
+                }
+                if args.is_empty() {
+                    return err("`exec_tensor` takes a command and its arguments", span);
+                }
+                let cmd = match &args[0] {
+                    Expr::Str(text, _) => text.clone(),
+                    _ => {
+                        return err(
+                            "`exec_tensor` expects the command as a string literal",
+                            span,
+                        )
+                    }
+                };
+                let ty = self.resolve(&type_args[0], span);
+                if !ty.is_tensor() {
+                    return err("`exec_tensor` expects a tensor type", span);
+                }
+                let mut targs = Vec::new();
+                for a in &args[1..] {
+                    let a = self.check_expr(a)?;
+                    if !a.ty().is_numeric() {
+                        return err(
+                            format!(
+                                "`exec_tensor` expects numeric arguments, found {}",
+                                a.ty().print()
+                            ),
+                            span,
+                        );
+                    }
+                    targs.push(a);
+                }
+                return Ok(TExpr::Sys {
+                    kind: SysKind::ExecTensor,
+                    cmd,
+                    args: targs,
+                    ty,
+                });
+            }
+            "exec" | "exec_i" | "exec_f" => {
+                if args.is_empty() {
+                    return err(format!("`{}` takes a command and its arguments", name), span);
+                }
+                let cmd = match &args[0] {
+                    Expr::Str(text, _) => text.clone(),
+                    _ => {
+                        return err(
+                            format!("`{}` expects the command as a string literal", name),
+                            span,
+                        )
+                    }
+                };
+                // The placeholders of the command: {k}, counting the escapes.
+                let mut slots: i64 = 0;
+                let bytes: Vec<char> = cmd.chars().collect();
+                let mut i = 0;
+                while i < bytes.len() {
+                    if bytes[i] == '{' {
+                        if i + 1 < bytes.len() && bytes[i + 1] == '{' {
+                            i += 2;
+                            continue;
+                        }
+                        let mut k: i64 = 0;
+                        let mut j = i + 1;
+                        while j < bytes.len() && bytes[j].is_ascii_digit() {
+                            k = k * 10 + (bytes[j] as u8 - b'0') as i64;
+                            j += 1;
+                        }
+                        if j < bytes.len() && bytes[j] == '}' && k + 1 > slots {
+                            slots = k + 1;
+                        }
+                    }
+                    i += 1;
+                }
+                if slots != args.len() as i64 - 1 {
+                    return err(
+                        format!(
+                            "`{}` has {} placeholder(s) but {} argument(s) were given",
+                            name,
+                            slots,
+                            args.len() - 1
+                        ),
+                        span,
+                    );
+                }
+                let mut targs = Vec::new();
+                for a in &args[1..] {
+                    let a = self.check_expr(a)?;
+                    let t = a.ty();
+                    if !t.is_numeric() {
+                        return err(
+                            format!(
+                                "`{}` expects numeric arguments, found {}",
+                                name,
+                                t.print()
+                            ),
+                            span,
+                        );
+                    }
+                    targs.push(a);
+                }
+                let kind = match name {
+                    "exec" => SysKind::Exec,
+                    "exec_i" => SysKind::ExecI,
+                    _ => SysKind::ExecF,
+                };
+                let ty = match kind {
+                    SysKind::Exec => CType::Scalar(ScalarKind::I32),
+                    SysKind::ExecI => CType::Scalar(ScalarKind::I32),
+                    _ => CType::Scalar(ScalarKind::F32),
+                };
+                return Ok(TExpr::Sys { kind, cmd, args: targs, ty });
+            }
+            "assert" => {
+                if args.len() != 2 {
+                    return err("`assert` takes a condition and a message", span);
+                }
+                let cmd = match &args[1] {
+                    Expr::Str(text, _) => text.clone(),
+                    _ => {
+                        return err(
+                            "the message of `assert` must be a string literal",
+                            span,
+                        )
+                    }
+                };
+                let cond = self.check_expr(&args[0])?;
+                if cond.ty() != CType::Scalar(ScalarKind::I1) {
+                    return err(
+                        format!(
+                            "the condition of `assert` must be a bool, found {}",
+                            cond.ty().print()
+                        ),
+                        span,
+                    );
+                }
+                return Ok(TExpr::Sys {
+                    kind: SysKind::Assert,
+                    cmd,
+                    args: vec![cond],
+                    ty: CType::Void,
+                });
+            }
+            "now_ms" => {
+                if !args.is_empty() {
+                    return err("`now_ms` takes no arguments", span);
+                }
+                return Ok(TExpr::Call {
+                    name: "mlr_now_ms".to_string(),
+                    type_args: vec![],
+                    args: vec![],
+                    ret: CType::Scalar(ScalarKind::I64),
+                });
+            }
+            "exit" => {
+                if args.len() != 1 {
+                    return err("`exit` takes the exit code", span);
+                }
+                let a = self.check_expr(&args[0])?;
+                let t = a.ty();
+                if !t.is_numeric() {
+                    return err(
+                        format!("`exit` expects a number, found {}", t.print()),
+                        span,
+                    );
+                }
+                return Ok(TExpr::Call {
+                    name: "mlr_exit".to_string(),
+                    type_args: vec![],
+                    args: vec![a],
+                    ret: CType::Void,
+                });
             }
             "value_and_grad" => {
                 // `value_and_grad(f, args...)`: the gradient of a function
@@ -2612,10 +3366,57 @@ impl Checker {
                 }
                 return Ok(TExpr::Save { path, tensors, keys });
             }
+            "reshape" => {
+                return self.check_reshape(type_args, args, span);
+            }
+            "rand_uniform" | "rand_normal" => {
+                if type_args.len() != 1 {
+                    return err(format!("`{}` takes exactly one type argument", name), span);
+                }
+                if args.len() != 3 {
+                    return err(format!("`{}` takes a seed and two values", name), span);
+                }
+                let ty = self.resolve(&type_args[0], span);
+                if !ty.is_tensor() {
+                    return err(format!("`{}` expects a tensor type", name), span);
+                }
+                let mut targs = Vec::new();
+                for a in args {
+                    targs.push(self.check_expr(a)?);
+                }
+                let t = targs[0].ty();
+                if t != CType::Scalar(ScalarKind::I32) && t != CType::Scalar(ScalarKind::I64) {
+                    return err(format!("`{}` expects the seed as an integer", name), span);
+                }
+                if t == CType::Scalar(ScalarKind::I64) {
+                    targs[0] = TExpr::Cast {
+                        value: Box::new(targs[0].clone()),
+                        from: t,
+                        to: CType::Scalar(ScalarKind::I32),
+                    };
+                }
+                let a = self.call_f32_scalar(&mut targs, 1, span)?;
+                let b = self.call_f32_scalar(&mut targs, 2, span)?;
+                let _ = (a, b);
+                return Ok(TExpr::Domain {
+                    op: if name == "rand_uniform" {
+                        DomainOp::RandUniform
+                    } else {
+                        DomainOp::RandNormal
+                    },
+                    args: targs,
+                    params: vec![],
+                    ty,
+                });
+            }
             "matmul" | "conv2d" | "maxpool2d" | "relu" | "flatten" | "row" | "argmax"
             | "add_bias" | "embed" | "embed_seq" | "transpose" | "layernorm"
             | "softmax_causal" | "sample" | "cross_entropy" | "softmax" | "sum"
-            | "softmax_tri" | "add"
+            | "softmax_tri" | "add" | "tmin" | "tmax" | "tclamp" | "tpow" | "texp"
+            | "tln" | "mean" | "argmin" | "norm1" | "norm2" | "var" | "std" | "dot"
+            | "concat" | "rows" | "reverse" | "iota" | "linspace" | "onehot"
+            | "rand_permutation" | "gather"
+            | "dropout" | "accuracy"
                 if !self.sigs.contains_key(name) =>
             {
                 // A function of the program shadows the builtin.
@@ -2638,34 +3439,56 @@ impl Checker {
                 });
             }
             // The scalar functions of the runtime library.
-            "exp" | "ln" | "sqrt" | "tanh" | "sigmoid" | "gelu" => {
+            // The scalar functions of the runtime library; every one has a
+            // fixed signature over f32 (or bool for the predicates).
+            "exp" | "ln" | "sqrt" | "tanh" | "sigmoid" | "gelu" | "abs" | "floor"
+            | "ceil" | "round" | "sign" => {
                 if args.len() != 1 {
                     return err(format!("`{}` takes exactly one argument", name), span);
                 }
-                let a = self.check_expr(&args[0])?;
-                let t = a.ty();
-                if !t.is_float() {
-                    return err(
-                        format!("`{}` expects a float, found {}", name, t.print()),
-                        span,
-                    );
+                return self.call_f32(name, args, span);
+            }
+            "is_nan" | "is_finite" => {
+                if args.len() != 1 {
+                    return err(format!("`{}` takes exactly one argument", name), span);
                 }
-                // The runtime works with single precision floats.
-                let a = if t == CType::Scalar(ScalarKind::F32) {
-                    a
-                } else {
-                    TExpr::Cast {
-                        value: Box::new(a),
-                        from: t,
-                        to: CType::Scalar(ScalarKind::F32),
+                let a = self.call_f32(name, args, span)?;
+                let ret = match a {
+                    TExpr::Call { mut args, .. } => {
+                        args.clear();
+                        TExpr::Call {
+                            name: format!("mlr_{}", name),
+                            type_args: vec![],
+                            args,
+                            ret: CType::Scalar(ScalarKind::I1),
+                        }
                     }
+                    _ => unreachable!(),
                 };
-                return Ok(TExpr::Call {
-                    name: format!("mlr_{}", name),
-                    type_args: vec![],
-                    args: vec![a],
-                    ret: CType::Scalar(ScalarKind::F32),
-                });
+                return Ok(ret);
+            }
+            "pow" | "min" | "max" => {
+                if args.len() != 2 {
+                    return err(format!("`{}` takes exactly two arguments", name), span);
+                }
+                return self.call_f32(name, args, span);
+            }
+            "clamp" => {
+                if args.len() != 3 {
+                    return err(format!("`{}` takes exactly three arguments", name), span);
+                }
+                return self.call_f32(name, args, span);
+            }
+            "pi" | "e" => {
+                if !args.is_empty() {
+                    return err(format!("`{}` takes no arguments", name), span);
+                }
+                let value = if name == "pi" {
+                    std::f64::consts::PI
+                } else {
+                    std::f64::consts::E
+                };
+                return Ok(TExpr::ConstFloat(value, CType::Scalar(ScalarKind::F32)));
             }
             "print_byte" => {
                 if args.len() != 1 {

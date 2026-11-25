@@ -1,0 +1,79 @@
+// Mini-batch training of an MLP on MNIST, entirely in MLR.
+//
+// Every step draws a batch of ten images: a random permutation of the data
+// set (`rand_permutation`) is sliced (`rows`) and the batch is gathered
+// (`gather`). The gradients come from `value_and_grad`, the update is plain
+// gradient descent, and the accuracy of the trained model is counted at the
+// end (the model sees every image twenty times).
+
+fn loss(
+    w1: Tensor<784x32xf32>,
+    b1: Tensor<32xf32>,
+    w2: Tensor<32x10xf32>,
+    b2: Tensor<10xf32>,
+    x: Tensor<10x784xf32>,
+    y: Tensor<10xi32>
+) -> f32 {
+    let h = relu(add_bias(matmul(x, w1), b1))
+    let logits = add_bias(matmul(h, w2), b2)
+    yield cross_entropy(logits, y)
+}
+
+fn predict(
+    w1: Tensor<784x32xf32>,
+    b1: Tensor<32xf32>,
+    w2: Tensor<32x10xf32>,
+    b2: Tensor<10xf32>,
+    img: Tensor<784xf32>
+) -> i32 {
+    let h = relu(add_bias(matmul(img, w1), b1))
+    yield argmax(add_bias(matmul(h, w2), b2))
+}
+
+// The weights of the network, bundled for the training loop.
+struct Net {
+    w1: Tensor<784x32xf32>,
+    b1: Tensor<32xf32>,
+    w2: Tensor<32x10xf32>,
+    b2: Tensor<10xf32>
+}
+
+fn main() {
+    let images = mlr.load<Tensor<100x784xf32>>("examples/train/images.bin")
+    let labels = mlr.load<Tensor<100xi32>>("examples/train/labels.bin")
+    let w1 = mlr.load<Tensor<784x32xf32>>("examples/train/aw1.bin")
+    let b1 = mlr.load<Tensor<32xf32>>("examples/train/ab1.bin")
+    let w2 = mlr.load<Tensor<32x10xf32>>("examples/train/aw2.bin")
+    let b2 = mlr.load<Tensor<10xf32>>("examples/train/ab2.bin")
+
+    let start = Net { w1: w1, b1: b1, w2: w2, b2: b2 }
+
+    let trained = for step in 0..200 step 1 iter(state = start) {
+        let w1 = state.w1
+        let b1 = state.b1
+        let w2 = state.w2
+        let b2 = state.b2
+        // The batch: ten images, drawn by a fresh permutation.
+        let perm = rand_permutation(100, step + 7)
+        let idx = rows(perm, 0, 10)
+        let x = gather(images, idx)
+        let y = gather(labels, idx)
+        let (l, dw1, db1, dw2, db2, _, _) = value_and_grad(
+            loss, w1, b1, w2, b2, x, y
+        )
+        if step % 40 == 0 {
+            print(l)
+        }
+        yield state with {
+            w1: map(w1, dw1) |a, g| { yield a - 0.3 * g },
+            b1: map(b1, db1) |a, g| { yield a - 0.3 * g },
+            w2: map(w2, dw2) |a, g| { yield a - 0.3 * g },
+            b2: map(b2, db2) |a, g| { yield a - 0.3 * g }
+        }
+    }
+
+    // The accuracy on the whole data set.
+    let hidden = relu(add_bias(matmul(images, trained.w1), trained.b1))
+    let logits = add_bias(matmul(hidden, trained.w2), trained.b2)
+    print(accuracy(logits, labels))
+}

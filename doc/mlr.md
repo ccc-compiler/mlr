@@ -264,9 +264,57 @@ collected until the statement ends and the `.pt` archive is then written.
 writes a checkpoint; these are the only impure operations. The scalar
 functions are `exp`, `ln`, `sqrt`, `tanh`, `sigmoid` and `gelu`.
 
+The scalar math of the library: `abs`, `min`, `max`, `clamp`, `pow`,
+`floor`, `ceil`, `round`, `sign`, `is_nan`, `is_finite`, `pi`, `e` — besides
+`exp`, `ln`, `sqrt`, `tanh`, `sigmoid` and `gelu`.
+
 The examples end with `examples/gpt/gpt.mlr`, a causal transformer (two
 layers, two heads, gelu, layer normalization) that generates text byte by
 byte; its weights were trained with `tools/train_torch_models.py`.
+
+## Standard library
+
+The tensor functions of the runtime (see [lib.md](lib.md) for the full list):
+
+| Function | Types | Meaning |
+| -------- | ----- | ------- |
+| `tmin(a, b)` `tmax(a, b)` | two tensors of one shape, or one tensor → scalar | element wise or reduction |
+| `tclamp(x, lo, hi)` | tensor, f32, f32 | clamps every element |
+| `tpow(x, p)` | tensor, f32 | element wise power |
+| `texp(x)` `tln(x)` | tensor | element wise exponential/logarithm |
+| `mean(x)` `var(x)` `std(x)` `norm1(x)` `norm2(x)` `dot(a, b)` | tensor(s) → f32 | reductions |
+| `argmin(x)` | tensor → i32 | the index of the smallest element |
+| `reshape<Tensor<...>>(x)` | tensor | the same elements in a new shape |
+| `concat(a, b)` | two tensors | along the first axis |
+| `rows(t, start, count)` | tensor, i32, i32 | a slice of the rows |
+| `reverse(x)` | tensor | the rows in the reverse order |
+| `iota(n)` | i32 → `Tensor<nxi32>` | the integers 0..n-1 |
+| `linspace(a, b, n)` | f32, f32, i32 | n evenly spaced values |
+| `onehot(ids, vocab)` | `Tensor<Mxi32>`, i32 | a one-hot matrix |
+| `rand_uniform<Tensor<...>>(seed, lo, hi)` | i32, f32, f32 | uniform random values (reproducible: the seed is explicit) |
+| `rand_normal<Tensor<...>>(seed, mean, std)` | i32, f32, f32 | normal random values (Box–Muller) |
+| `rand_permutation(n, seed)` | i32, i32 → `Tensor<nxi32>` | a random permutation (Fisher–Yates) |
+| `gather(t, idx)` | tensor, `Tensor<Kxi32>` | the selected rows (any element type) |
+| `dropout(x, seed, rate)` | tensor, i32, f32 | training-time dropout (the mask is recomputed in the gradient) |
+| `accuracy(logits, labels)` | `Tensor<MxVxf32>`, `Tensor<Mxi32>` → f32 | the share of the rows whose argmax is the label |
+
+The system functions call the shell (the command is a string literal, the
+arguments are numbers that fill the `{0}`, `{1}`… placeholders):
+
+```
+let code = exec("ls -la")                     // the exit code
+let n = exec_i("wc -l < data.txt")            // the first integer of the output
+let lr = exec_f("python3 -c 'print(0.001)'")  // the first float
+let w = exec_tensor<Tensor<100x784xf32>>(
+    "python3 -c 'import numpy as np, sys; np.savetxt(sys.stdout, np.random.rand(100, 784))'"
+)
+assert(n > 0, "the data set is empty")
+let t0 = now_ms()
+exit(1)                                       // ends the program
+```
+
+All of them are impure, and none of them can appear in a function that is
+differentiated with `value_and_grad`.
 
 ## Training
 
