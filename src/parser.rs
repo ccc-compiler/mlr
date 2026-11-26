@@ -96,7 +96,17 @@ impl Parser {
     pub fn parse_program(&mut self) -> PResult<Program> {
         let mut prog = Program::default();
         while !matches!(self.peek(), Tok::Eof) {
-            if self.at_kw("struct") {
+            if self.at_kw("use") {
+                let span = self.bump().span;
+                let path = match self.peek().clone() {
+                    Tok::Str(p) => {
+                        self.bump();
+                        p
+                    }
+                    _ => return self.err("expected a file name after `use`"),
+                };
+                prog.uses.push(Use { path, span });
+            } else if self.at_kw("struct") {
                 prog.structs.push(self.parse_struct()?);
             } else if self.at_kw("impl") {
                 prog.impls.push(self.parse_impl()?);
@@ -154,6 +164,33 @@ impl Parser {
     fn parse_func_inner(&mut self, in_impl: Option<&str>) -> PResult<Func> {
         let span = self.expect_kw("fn")?;
         let (name, _) = self.expect_ident()?;
+        // The type parameters: `fn f<N: i64, M: i64>(...)`. Only shape
+        // constants are supported.
+        let mut type_params = Vec::new();
+        if self.at_punct("<") {
+            self.bump();
+            loop {
+                let (pname, pspan) = self.expect_ident()?;
+                self.expect_punct(":")?;
+                let (kind, kspan) = self.expect_ident()?;
+                match crate::ir::Type::scalar(&kind) {
+                    Some(crate::ir::Type::Scalar(crate::ir::ScalarKind::I32))
+                    | Some(crate::ir::Type::Scalar(crate::ir::ScalarKind::I64)) => {}
+                    _ => {
+                        let _ = kspan;
+                        return self.err(format!(
+                            "the type parameter `{}:{}` must be `i64`",
+                            pname, kind
+                        ));
+                    }
+                }
+                type_params.push((pname, pspan));
+                if !self.eat_punct(",") {
+                    break;
+                }
+            }
+            self.expect_punct(">")?;
+        }
         self.expect_punct("(")?;
         let mut params = Vec::new();
         if !self.at_punct(")") {
@@ -184,6 +221,7 @@ impl Parser {
         let body = self.parse_block()?;
         Ok(Func {
             name,
+            type_params,
             params,
             ret,
             body,
@@ -209,6 +247,18 @@ impl Parser {
                             self.bump();
                             dims.push(SrcDim::Dynamic);
                         }
+                        // A named dimension: `Tensor<Nxf32>` lexes as the
+                        // single identifier `Nxf32`.
+                        Tok::Ident(n) if dims.is_empty() && elem.is_none() => {
+                            match self.split_dims(&n)? {
+                                Some((more, e)) => {
+                                    self.bump();
+                                    dims.extend(more);
+                                    elem = Some(e);
+                                }
+                                None => break,
+                            }
+                        }
                         _ => break,
                     }
                     // The separator between the dimensions and the element
@@ -225,7 +275,15 @@ impl Parser {
                         match n.strip_prefix('x') {
                             Some(rest) => {
                                 self.bump();
-                                elem = Some(self.scalar_type(rest, &span)?);
+                                // `4xNxf32`: the rest may hold more named
+                                // dimensions before the element type.
+                                match self.split_dims(rest)? {
+                                    Some((more, e)) => {
+                                        dims.extend(more);
+                                        elem = Some(e);
+                                    }
+                                    None => elem = Some(self.scalar_type(rest, &span)?),
+                                }
                                 break;
                             }
                             None => break,
@@ -249,17 +307,73 @@ impl Parser {
             _ => match crate::ir::Type::scalar(&name) {
                 Some(crate::ir::Type::Scalar(k)) => Ok(SrcType::Scalar(k)),
                 Some(crate::ir::Type::Index) => Ok(SrcType::Index),
-                // The name of a struct; the checker knows whether it exists.
-                _ => Ok(SrcType::Named(name)),
+                // A shorthand tensor type with named dimensions:
+                // `Tensor<Nxf32>` lexes as the single identifier `Nxf32`.
+                _ => {
+                    if let Some((dims, elem)) = self.split_dims(&name)? {
+                        Ok(SrcType::Tensor {
+                            dims,
+                            elem: Box::new(elem),
+                        })
+                    } else {
+                        // The name of a struct; the checker knows whether it
+                        // exists.
+                        Ok(SrcType::Named(name))
+                    }
+                }
             },
         }
     }
 
+    /// Splits an identifier like `Nxf32` or `NxMxf32` into named dimensions
+    /// and the element type; `None` when the name is not of this shape.
+    fn split_dims(&self, name: &str) -> PResult<Option<(Vec<SrcDim>, SrcType)>> {
+        let parts: Vec<&str> = name.split('x').collect();
+        if parts.len() < 2 {
+            return Ok(None);
+        }
+        let last = parts[parts.len() - 1];
+        let elem = match crate::ir::Type::scalar(last) {
+            Some(crate::ir::Type::Scalar(k)) => SrcType::Scalar(k),
+            _ => return Ok(None),
+        };
+        let dims = parts[..parts.len() - 1]
+            .iter()
+            .map(|p| SrcDim::Named((*p).to_string()))
+            .collect();
+        Ok(Some((dims, elem)))
+    }
+
     /// Whether the `<` at the current position starts a list of type
-    /// arguments.
+    /// arguments. A small forward scan: the list must close with a `>` that
+    /// is directly followed by `(`, so that `a < b` stays a comparison.
     fn looks_like_type_args(&self) -> bool {
         match self.peek_at(1) {
-            Tok::Ident(name) => name == "Tensor" || crate::ir::Type::scalar(name).is_some(),
+            Tok::Ident(name) if name == "Tensor" || crate::ir::Type::scalar(name).is_some() => {
+                true
+            }
+            // A shape constant: `f<4>(x)`.
+            Tok::Int(_) => {
+                let mut depth = 1i32;
+                let mut i = 2;
+                loop {
+                    match self.peek_at(i) {
+                        Tok::Int(_) | Tok::Ident(_) | Tok::Punct(",") | Tok::Punct("x") => i += 1,
+                        Tok::Punct("<") => {
+                            depth += 1;
+                            i += 1;
+                        }
+                        Tok::Punct(">") => {
+                            depth -= 1;
+                            if depth == 0 {
+                                return matches!(self.peek_at(i + 1), Tok::Punct("("));
+                            }
+                            i += 1;
+                        }
+                        _ => return false,
+                    }
+                }
+            }
             _ => false,
         }
     }
@@ -555,7 +669,12 @@ impl Parser {
                 if self.at_punct("<") && self.looks_like_type_args() {
                     self.bump();
                     loop {
-                        type_args.push(self.parse_type()?);
+                        if let Tok::Int(v) = self.peek().clone() {
+                            self.bump();
+                            type_args.push(SrcType::Const(v));
+                        } else {
+                            type_args.push(self.parse_type()?);
+                        }
                         if !self.eat_punct(",") {
                             break;
                         }

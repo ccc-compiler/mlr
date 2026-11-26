@@ -1,0 +1,45 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  # Linux: the CPU runtime. `MLR_REQUIRE_E2E` turns a missing tool chain into a
+  # failure, so the end-to-end tests can never be silently skipped here.
+  linux:
+    runs-on: ubuntu-latest
+    env:
+      MLR_REQUIRE_E2E: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install LLVM (mlir-opt, mlir-translate, clang)
+        uses: KyleMayes/install-llvm-action@v2
+        with:
+          version: "18.1.8"
+      - name: Build
+        run: cargo build --release
+      - name: Unit, integration and end-to-end tests
+        run: cargo test --release
+
+  # macOS: the same tests plus the Metal Performance Shaders runtime. On a
+  # runner without a GPU the MPS runtime falls back to the CPU (its output is
+  # still checked), so this also verifies the shared interface.
+  macos:
+    runs-on: macos-latest
+    env:
+      MLR_REQUIRE_E2E: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install LLVM (mlir-opt, mlir-translate, clang)
+        uses: KyleMayes/install-llvm-action@v2
+        with:
+          version: "18.1.8"
+      - name: Build
+        run: cargo build --release
+      - name: Unit, integration and end-to-end tests (CPU and Metal)
+        run: cargo test --release
+      - name: Every example on both runtimes
+        run: ./scripts/run_all.sh

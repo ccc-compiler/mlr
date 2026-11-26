@@ -19,9 +19,11 @@
 extern "C" {
 #define mlr_matmul mlr_matmul_cpu
 #define mlr_conv2d mlr_conv2d_cpu
+#define mlr_matmul_grad mlr_matmul_grad_cpu
 #include "mlr_runtime.c"
 #undef mlr_matmul
 #undef mlr_conv2d
+#undef mlr_matmul_grad
 }
 
 #import <Foundation/Foundation.h>
@@ -141,6 +143,41 @@ void gemm(const float *A, size_t M, size_t K, const float *B, size_t N, float *C
 // The matrix multiplication runs on the GPU.
 extern "C" void mlr_matmul(const void *a, const void *b, void *c, int64_t M, int64_t N, int64_t K) {
     gemm((const float *)a, (size_t)M, (size_t)K, (const float *)b, (size_t)N, (float *)c);
+}
+
+// Transposes a row major matrix.
+static void transpose_f32(const float *a, size_t rows, size_t cols, float *out) {
+    for (size_t i = 0; i < rows; i++) {
+        for (size_t j = 0; j < cols; j++) {
+            out[j * rows + i] = a[i * cols + j];
+        }
+    }
+}
+
+// The gradient of the matrix multiplication: two matrix multiplications on
+// the GPU, with the transposed operand packed into a temporary buffer.
+// dx (M x K) = dy (M x N) @ w^T; dw (K x N) = x^T @ dy.
+extern "C" void mlr_matmul_grad(const void *x, const void *w, const void *dy, void *dx, void *dw,
+                                int64_t M, int64_t K, int64_t N) {
+    Ctx &c = ctx();
+    if (c.device == nil) {
+        mlr_matmul_grad_cpu(x, w, dy, dx, dw, M, K, N);
+        return;
+    }
+    float *wt = (float *)malloc((size_t)(K * N) * sizeof(float));
+    float *xt = (float *)malloc((size_t)(K * M) * sizeof(float));
+    if (wt == nullptr || xt == nullptr) {
+        free(wt);
+        free(xt);
+        mlr_matmul_grad_cpu(x, w, dy, dx, dw, M, K, N);
+        return;
+    }
+    transpose_f32((const float *)w, (size_t)K, (size_t)N, wt);
+    transpose_f32((const float *)x, (size_t)M, (size_t)K, xt);
+    gemm((const float *)dy, (size_t)M, (size_t)N, wt, (size_t)K, (float *)dx);
+    gemm(xt, (size_t)K, (size_t)M, (const float *)dy, (size_t)N, (float *)dw);
+    free(wt);
+    free(xt);
 }
 
 // The convolution is an im2col transformation followed by a matrix

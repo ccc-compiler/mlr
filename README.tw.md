@@ -144,7 +144,7 @@ runtime 函式庫的呼叫，而 runtime 函式庫有兩個介面相同的實作
 
 * `runtime/mlr_runtime.c` 以純迴圈在 CPU 上計算全部運算，
 * `runtime/mlr_runtime_mps.mm` 以 `MPSMatrixMultiplication` 在 GPU 上計算矩陣
-  乘法與卷積（卷積會先轉成 im2col，再做一次矩陣乘法）。
+  乘法（前向與反向）與卷積（卷積會先轉成 im2col，再做一次矩陣乘法）。
 
 程式本身並不知道它連結的是哪一個 runtime。
 
@@ -186,6 +186,7 @@ let w = mlr.load<Tensor<50257x768xf32>>("hf://openai-community/gpt2/model.safete
 * [doc/struct.md](doc/struct.md) — struct 型別的設計
 * [doc/train.md](doc/train.md) — 訓練（反向傳播）的設計
 * [doc/lib.md](doc/lib.md) — 標準函式庫的設計（數學、張量、隨機、shell 橋接）
+* [doc/v1.x.md](doc/v1.x.md) — v1.x 路線圖
 
 ## 目錄結構
 

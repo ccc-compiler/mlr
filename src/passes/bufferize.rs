@@ -163,10 +163,15 @@ impl Bufferizer {
                 "tensor.insert" => {
                     // tensor.insert(value, tensor, indices...) -> memref.store
                     let value = op.operands[0].clone();
-                    let mut buf = self.buffer_of(&op.operands[1]);
-                    if self.consts.contains(&buf.id) {
-                        // The buffer is a constant: it is copied, so that the
-                        // original values stay untouched.
+                    let tensor = op.operands[1].clone();
+                    let mut buf = self.buffer_of(&tensor);
+                    // The store must not be seen through the original value:
+                    // copy when the input is a constant, a parameter of the
+                    // function, or read again somewhere else.
+                    if self.consts.contains(&buf.id)
+                        || self.params.contains(&buf.id)
+                        || self.counts.get(&tensor.id).copied().unwrap_or(0) > 1
+                    {
                         let ty = buf.ty.clone();
                         let mut alloc = Op::new("memref.alloc");
                         let copy = self.fresh(ty.clone());

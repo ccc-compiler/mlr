@@ -80,6 +80,31 @@ fn name(a: i32, b: f32) -> i32 {
 
 The result type may be omitted; the function then returns nothing.
 
+A function may take **shape constants** as type parameters; they stand for
+the dimensions of its tensor types and are values in the body:
+
+```
+fn filled<N: i64>(v: f32) -> Tensor<Nxf32> {
+    let t = tensor.zeros<Tensor<Nxf32>>()
+    let out = for i in 0..N step 1 iter(t = t) {
+        yield tensor.insert(t, [i], v)
+    }
+    yield out
+}
+
+let a = filled<4>(2.0)        // a Tensor<4xf32> of 2.0
+```
+
+Every distinct set of shape arguments checks (and monomorphizes) one
+instance of the function; `filled<3>` and `filled<4>` are two functions.
+
+## Modules
+
+`use "relative/path.mlr"` pulls the structs and functions of another file
+into a flat namespace. The path is resolved relative to the directory of
+the file that contains the `use`; cycles are reported, and duplicate
+definitions are errors, across files as within one.
+
 ## Structs
 
 ```
@@ -287,6 +312,14 @@ result is a writable tensor:
 let w = mlr.load_runtime<Tensor<784x32xf32>>("model_w1.bin")
 ```
 
+`mlr.load_batch<T>(path, row)` reads only a contiguous range of rows of the
+first dimension — the first dimension of `T` is the size of the batch, the
+file's first dimension is its extent:
+
+```
+let b = mlr.load_batch<Tensor<32x784xf32>>("data.bin", step * 32)
+```
+
 The file carries the shape in a small header (magic `MLRRWT01`, the rank,
 the dimensions, then the little endian f32/i32 values);
 `tools/to_raw.py` converts a `.safetensors` or `.npy` file. A `hf://` path
@@ -318,6 +351,10 @@ The tensor functions of the runtime (see [lib.md](lib.md) for the full list):
 | `gather(t, idx)` | tensor, `Tensor<Kxi32>` | the selected rows (any element type) |
 | `dropout(x, seed, rate)` | tensor, i32, f32 | training-time dropout (the mask is recomputed in the gradient) |
 | `accuracy(logits, labels)` | `Tensor<MxVxf32>`, `Tensor<Mxi32>` → f32 | the share of the rows whose argmax is the label |
+| `sum_axis(x, a)` `mean_axis(x, a)` `tmin_axis(x, a)` `tmax_axis(x, a)` | tensor, i32 | the reduction along the axis `a` (a constant) |
+| `argmin_axis(x, a)` `argmax_axis(x, a)` | tensor, i32 → `Tensor<...xi32>` | the index of the extreme along the axis |
+| `sort(x)` `cumsum(x)` | tensor | ascending sort, inclusive prefix sum — along the last axis |
+| `argsort(x)` | tensor → `Tensor<...xi32>` | the indices of the ascending sort (stable) |
 
 The system functions call the shell (the command is a string literal, the
 arguments are numbers that fill the `{0}`, `{1}`… placeholders):
@@ -402,6 +439,7 @@ See [architecture.md](architecture.md) for the details of every stage.
 
 ## Not implemented (yet)
 
+* element type generics (only shape constants `fn f<N: i64>` are supported),
 * symbolic dimensions with equality constraints (the current implementation
   unifies `?` with static dimensions but does not track symbolic identities
   across a function),

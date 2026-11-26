@@ -155,9 +155,10 @@ Both scripts compile the *same* program: the domain operations (`matmul`,
 library has two implementations with the same interface:
 
 * `runtime/mlr_runtime.c` computes everything with plain loops on the CPU,
-* `runtime/mlr_runtime_mps.mm` computes the matrix multiplication and the
-  convolution with `MPSMatrixMultiplication` on the GPU (the convolution
-  becomes an im2col transformation followed by a matrix multiplication).
+* `runtime/mlr_runtime_mps.mm` computes the matrix multiplication (forward
+  and backward) and the convolution with `MPSMatrixMultiplication` on the GPU
+  (the convolution becomes an im2col transformation followed by a matrix
+  multiplication).
 
 The program itself does not know which runtime it is linked against.
 
@@ -202,6 +203,7 @@ See [doc/mlr.md](doc/mlr.md) for the details.
 * [doc/struct.md](doc/struct.md) — the design of the struct types
 * [doc/train.md](doc/train.md) — the design of the training (backpropagation)
 * [doc/lib.md](doc/lib.md) — the design of the standard library (math, tensors, randomness, the shell bridge)
+* [doc/v1.x.md](doc/v1.x.md) — the roadmap for v1.x
 
 ## Layout
 

@@ -10,11 +10,27 @@
 //! The gradient of a value that flows into several operations is the sum of
 //! the contributions of its users (`mlr.add`).
 //!
-//! Restricted to straight line functions whose operations have a known
-//! adjoint; the checker only accepts `value_and_grad` on such functions.
+//! Control flow:
+//!
+//! * an `scf.if` is differentiated branch by branch: each region is reversed
+//!   with the adjoint of the result as the seed, and the contributions to
+//!   the values outside the region are reported through extra results of the
+//!   `scf.if`, where the two branches agree;
+//! * an `scf.for` is differentiated when its carried values are only
+//!   *accumulated* (`yield acc + expr`, also with `-` and a constant
+//!   factor): the backward pass is a loop over the same range that replays
+//!   the parts of the body that do not read the carried values, reverses
+//!   them with the carried adjoint as the seed, and accumulates the
+//!   contributions to the values outside the loop into extra iter args;
+//! * `tensor.extract` scatters its adjoint into a zero tensor with
+//!   `tensor.insert`; `tensor.insert` passes the adjoint through with the
+//!   written position removed.
+//!
+//! The checker (`check_differentiable`) accepts exactly what the transform
+//! below implements; everything else is rejected with a message.
 
 use crate::ir::{Attr, Builder, Dim, FuncOp, Op, Type, Value};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 /// The operations that have an adjoint, plus the ones that pass through.
 const FORWARD: &[&str] = &[
@@ -57,6 +73,9 @@ const FORWARD: &[&str] = &[
     "mlr.gather_grad",
     "mlr.dropout",
     "mlr.map",
+    "mlr.zeros",
+    "tensor.extract",
+    "tensor.insert",
     "arith.addf",
     "arith.subf",
     "arith.mulf",
@@ -67,15 +86,54 @@ const FORWARD: &[&str] = &[
     "arith.index_cast",
     "arith.trunci",
     "arith.extui",
+    // The comparisons produce i1: they are part of the forward pass (the
+    // condition of an `if`) and never receive an adjoint.
+    "arith.cmpf",
+    "arith.cmpi",
+    "arith.andi",
+    "arith.ori",
+    "arith.xori",
     "func.return",
 ];
+
+/// The state of the backward walk: where the adjoint operations go, and the
+/// adjoint of every value that has one.
+struct Bwd {
+    b: Builder,
+    /// The adjoint operations, in emission order. Swapped for the
+    /// operations of a region while one is being reversed.
+    ops: Vec<Op>,
+    /// The adjoint of every value that has one, keyed by the id of the value.
+    adj: HashMap<usize, Value>,
+    /// The runtime functions that the adjoints call.
+    used: Vec<&'static str>,
+    /// Set while a region (an `scf.if` branch or a backward loop body) is
+    /// being reversed: contributions to the values outside it are
+    /// accumulated inside and reported through its yield.
+    local: Option<Local>,
+}
+
+/// The reversal of one region.
+struct Local {
+    /// The values defined inside the region: their adjoints stay inside.
+    defined: HashSet<usize>,
+    /// The contributions to the values from outside the region, accumulated
+    /// with adds inside it; reported by the yield, in `outer_order`.
+    outer: HashMap<usize, Value>,
+    outer_order: Vec<usize>,
+}
 
 /// Builds `f.value_and_grad` from the IR of `f`: the loss and one gradient
 /// slot per tensor parameter. Returns the function and the runtime functions
 /// it calls (for the declarations of the module).
 pub fn value_and_grad_of(f: &FuncOp, funcs: &[FuncOp]) -> (FuncOp, Vec<&'static str>) {
-    let mut b = Builder::new();
-    let mut used: Vec<&'static str> = Vec::new();
+    let mut bwd = Bwd {
+        b: Builder::new(),
+        ops: Vec::new(),
+        adj: HashMap::new(),
+        used: Vec::new(),
+        local: None,
+    };
 
     let mut body = f.body.blocks[0].ops.clone();
     // The loss is the value that the function returns.
@@ -87,147 +145,278 @@ pub fn value_and_grad_of(f: &FuncOp, funcs: &[FuncOp]) -> (FuncOp, Vec<&'static 
         }
         _ => panic!("value_and_grad: the function must return one value"),
     };
-    let body = body;
 
-    // The adjoint of every value: the gradient that has accumulated so far.
-    // The loss starts with one.
-    let mut adj: HashMap<usize, Value> = HashMap::new();
     // The calls of pure functions are inlined, so that the backward walk
     // sees their operations.
     let forward = expand_calls(body, funcs, 0);
-    let mut ops: Vec<Op> = forward.clone();
+    bwd.ops = forward.clone();
 
     let mut one = Op::new("arith.constant");
     one.attrs.push(("value".into(), Attr::Float(1.0)));
-    let seed = b.fresh_value(Type::Scalar(crate::ir::ScalarKind::F32));
+    let seed = bwd
+        .b
+        .fresh_value(Type::Scalar(crate::ir::ScalarKind::F32));
     one.results.push(seed.clone());
-    ops.push(one);
-    adj.insert(loss.id, seed);
+    bwd.ops.push(one);
+    bwd.adj.insert(loss.id, seed);
 
     // The backward pass, from the loss back to the parameters.
-    for op in forward.iter().rev() {
-        let y = match op.results.first() {
-            Some(r) => r.clone(),
-            None => continue,
+    for (index, op) in forward.iter().enumerate().rev() {
+        match op.name.as_str() {
+            "scf.if" => bwd.diff_if(op, index),
+            "scf.for" => bwd.diff_for(op),
+            _ => {
+                let y = match op.results.first() {
+                    Some(r) => r.clone(),
+                    None => continue,
+                };
+                let dy = match bwd.adj.get(&y.id) {
+                    Some(v) => v.clone(),
+                    // Nothing depends on this value.
+                    None => continue,
+                };
+                bwd.emit_adjoint(op, &y, &dy);
+            }
+        }
+    }
+
+    // One result per tensor parameter: its gradient, or a zero tensor when
+    // the parameter does not reach the loss.
+    let mut results = vec![Type::Scalar(crate::ir::ScalarKind::F32)];
+    let mut returns = vec![loss];
+    for p in &f.params {
+        if !matches!(p.ty, Type::Tensor { .. }) {
+            continue;
+        }
+        let grad = match bwd.adj.remove(&p.id) {
+            Some(v) => v,
+            None => bwd.zero(&p.ty),
         };
-        let dy = match adj.get(&y.id) {
-            Some(v) => v.clone(),
-            // Nothing depends on this value.
-            None => continue,
-        };
+        results.push(grad.ty.clone());
+        returns.push(grad);
+    }
+
+    let mut term = Op::new("func.return");
+    term.operands = returns;
+    bwd.ops.push(term);
+
+    let func = FuncOp {
+        name: format!("{}.value_and_grad", f.name),
+        params: f.params.clone(),
+        results,
+        body: crate::ir::Region {
+            blocks: vec![crate::ir::Block {
+                args: vec![],
+                ops: bwd.ops,
+            }],
+        },
+        attrs: vec![("effects".to_string(), Attr::Str("pure".to_string()))],
+        loc: f.loc.clone(),
+    };
+    (func, bwd.used)
+}
+
+impl Bwd {
+    /// A zero of the given type, in the current operation list: `mlr.zeros`
+    /// for a tensor, a constant for an f32 scalar.
+    fn zero(&mut self, ty: &Type) -> Value {
+        zero_in(&mut self.ops, &mut self.b, ty)
+    }
+
+    /// Adds a contribution to the adjoint of a value. Inside a region, a
+    /// contribution to a value from outside it is accumulated inside and
+    /// reported through its yield. Gradients only flow through f32 scalars
+    /// and f32 tensors; every other target (indices, integers) is dropped.
+    fn accumulate(&mut self, target: &Value, contribution: Value) {
+        if !is_differentiable_type(&target.ty) {
+            return;
+        }
+        if let Some(local) = self.local.as_ref() {
+            if !local.defined.contains(&target.id) {
+                let current = match local.outer.get(&target.id) {
+                    Some(old) => {
+                        let old = old.clone();
+                        let ty = old.ty.clone();
+                        let mut sum = Op::new("mlr.add");
+                        sum.operands = vec![old, contribution];
+                        let res = self.b.fresh_value(ty);
+                        sum.results.push(res.clone());
+                        self.ops.push(sum);
+                        res
+                    }
+                    None => contribution,
+                };
+                let local = self.local.as_mut().unwrap();
+                if !local.outer_order.contains(&target.id) {
+                    local.outer_order.push(target.id);
+                }
+                local.outer.insert(target.id, current);
+                return;
+            }
+        }
+        match self.adj.get(&target.id) {
+            Some(old) => {
+                let old = old.clone();
+                let ty = old.ty.clone();
+                let mut sum = Op::new("mlr.add");
+                sum.operands = vec![old, contribution];
+                let res = self.b.fresh_value(ty);
+                sum.results.push(res.clone());
+                self.ops.push(sum);
+                self.adj.insert(target.id, res);
+            }
+            None => {
+                self.adj.insert(target.id, contribution);
+            }
+        }
+    }
+
+    /// Seeds the adjoint of a value while a region is being reversed: a
+    /// value of the region receives it directly, a value from outside it
+    /// receives it as a contribution.
+    fn seed(&mut self, value: &Value, dy: Value) {
+        let is_local = self
+            .local
+            .as_ref()
+            .map(|l| l.defined.contains(&value.id))
+            .unwrap_or(false);
+        if is_local {
+            match self.adj.get(&value.id) {
+                Some(old) => {
+                    let old = old.clone();
+                    let ty = old.ty.clone();
+                    let mut sum = Op::new("mlr.add");
+                    sum.operands = vec![old, dy];
+                    let res = self.b.fresh_value(ty);
+                    sum.results.push(res.clone());
+                    self.ops.push(sum);
+                    self.adj.insert(value.id, res);
+                }
+                None => {
+                    self.adj.insert(value.id, dy);
+                }
+            }
+        } else {
+            self.accumulate(value, dy);
+        }
+    }
+
+    /// The adjoint of one straight-line operation, appended to `self.ops`.
+    fn emit_adjoint(&mut self, op: &Op, y: &Value, dy: &Value) {
+        let dy = dy.clone();
         match op.name.as_str() {
             "mlr.matmul" => {
                 // dx = dy @ w^T, dw = x^T @ dy.
-                used.push("mlr_matmul_grad");
+                self.used.push("mlr_matmul_grad");
                 let x = op.operands[0].clone();
                 let w = op.operands[1].clone();
                 let mut g = Op::new("mlr.matmul_grad");
                 g.operands = vec![x.clone(), w.clone(), dy];
-                let dx = b.fresh_value(x.ty.clone());
-                let dw = b.fresh_value(w.ty.clone());
+                let dx = self.b.fresh_value(x.ty.clone());
+                let dw = self.b.fresh_value(w.ty.clone());
                 g.results = vec![dx.clone(), dw.clone()];
                 g.loc = op.loc.clone();
-                ops.push(g);
-                accumulate(&mut ops, &mut b, &mut adj, &x, dx);
-                accumulate(&mut ops, &mut b, &mut adj, &w, dw);
+                self.ops.push(g);
+                self.accumulate(&x, dx);
+                self.accumulate(&w, dw);
             }
             "mlr.add_bias" => {
                 // dm = dy, db = the sum of the rows of dy.
-                used.push("mlr_add_bias_grad");
+                self.used.push("mlr_add_bias_grad");
                 let m = op.operands[0].clone();
                 let bias = op.operands[1].clone();
                 let mut g = Op::new("mlr.add_bias_grad");
                 g.operands = vec![dy];
-                let dm = b.fresh_value(m.ty.clone());
-                let db = b.fresh_value(bias.ty.clone());
+                let dm = self.b.fresh_value(m.ty.clone());
+                let db = self.b.fresh_value(bias.ty.clone());
                 g.results = vec![dm.clone(), db.clone()];
                 g.loc = op.loc.clone();
-                ops.push(g);
-                accumulate(&mut ops, &mut b, &mut adj, &m, dm);
-                accumulate(&mut ops, &mut b, &mut adj, &bias, db);
+                self.ops.push(g);
+                self.accumulate(&m, dm);
+                self.accumulate(&bias, db);
             }
             "mlr.relu" => {
                 // dx = dy where x > 0.
-                used.push("mlr_relu_grad");
+                self.used.push("mlr_relu_grad");
                 let x = op.operands[0].clone();
                 let mut g = Op::new("mlr.relu_grad");
                 g.operands = vec![x.clone(), dy];
-                let dx = b.fresh_value(x.ty.clone());
+                let dx = self.b.fresh_value(x.ty.clone());
                 g.results = vec![dx.clone()];
                 g.loc = op.loc.clone();
-                ops.push(g);
-                accumulate(&mut ops, &mut b, &mut adj, &x, dx);
+                self.ops.push(g);
+                self.accumulate(&x, dx);
             }
             "mlr.sum" => {
                 // dx is the incoming gradient in every element.
-                used.push("mlr_sum_grad");
+                self.used.push("mlr_sum_grad");
                 let x = op.operands[0].clone();
                 let mut g = Op::new("mlr.sum_grad");
                 g.operands = vec![x.clone(), dy];
-                let dx = b.fresh_value(x.ty.clone());
+                let dx = self.b.fresh_value(x.ty.clone());
                 g.results = vec![dx.clone()];
-                ops.push(g);
-                accumulate(&mut ops, &mut b, &mut adj, &x, dx);
+                self.ops.push(g);
+                self.accumulate(&x, dx);
             }
             "mlr.flatten" => {
                 // The inverse of the flatten is the reshape of the same
                 // layout: a copy.
-                used.push("mlr_copy");
+                self.used.push("mlr_copy");
                 let x = op.operands[0].clone();
                 let mut g = Op::new("mlr.flatten_grad");
                 g.operands = vec![dy];
-                let dx = b.fresh_value(x.ty.clone());
+                let dx = self.b.fresh_value(x.ty.clone());
                 g.results = vec![dx.clone()];
-                ops.push(g);
-                accumulate(&mut ops, &mut b, &mut adj, &x, dx);
+                self.ops.push(g);
+                self.accumulate(&x, dx);
             }
             "mlr.conv2d" => {
-                used.push("mlr_conv2d_grad");
+                self.used.push("mlr_conv2d_grad");
                 let x = op.operands[0].clone();
                 let w = op.operands[1].clone();
                 let bias = op.operands[2].clone();
                 let mut g = Op::new("mlr.conv2d_grad");
                 g.operands = vec![x.clone(), w.clone(), dy];
-                let dx = b.fresh_value(x.ty.clone());
-                let dw = b.fresh_value(w.ty.clone());
-                let db = b.fresh_value(bias.ty.clone());
+                let dx = self.b.fresh_value(x.ty.clone());
+                let dw = self.b.fresh_value(w.ty.clone());
+                let db = self.b.fresh_value(bias.ty.clone());
                 g.results = vec![dx.clone(), dw.clone(), db.clone()];
                 g.attrs = op.attrs.clone();
-                ops.push(g);
-                accumulate(&mut ops, &mut b, &mut adj, &x, dx);
-                accumulate(&mut ops, &mut b, &mut adj, &w, dw);
-                accumulate(&mut ops, &mut b, &mut adj, &bias, db);
+                self.ops.push(g);
+                self.accumulate(&x, dx);
+                self.accumulate(&w, dw);
+                self.accumulate(&bias, db);
             }
             "mlr.maxpool2d" => {
-                used.push("mlr_maxpool2d_grad");
+                self.used.push("mlr_maxpool2d_grad");
                 let x = op.operands[0].clone();
                 let mut g = Op::new("mlr.maxpool2d_grad");
                 g.operands = vec![x.clone(), dy];
-                let dx = b.fresh_value(x.ty.clone());
+                let dx = self.b.fresh_value(x.ty.clone());
                 g.results = vec![dx.clone()];
                 g.attrs = op.attrs.clone();
-                ops.push(g);
-                accumulate(&mut ops, &mut b, &mut adj, &x, dx);
+                self.ops.push(g);
+                self.accumulate(&x, dx);
             }
             "mlr.embed" => {
-                used.push("mlr_embed_grad");
+                self.used.push("mlr_embed_grad");
                 let table = op.operands[0].clone();
                 let mut g = Op::new("mlr.embed_grad");
                 g.operands = vec![table.clone(), op.operands[1].clone(), dy];
-                let dtable = b.fresh_value(table.ty.clone());
+                let dtable = self.b.fresh_value(table.ty.clone());
                 g.results = vec![dtable.clone()];
-                ops.push(g);
-                accumulate(&mut ops, &mut b, &mut adj, &table, dtable);
+                self.ops.push(g);
+                self.accumulate(&table, dtable);
             }
             "mlr.embed_seq" => {
-                used.push("mlr_embed_seq_grad");
+                self.used.push("mlr_embed_seq_grad");
                 let table = op.operands[0].clone();
                 let mut g = Op::new("mlr.embed_seq_grad");
                 g.operands = vec![table.clone(), op.operands[1].clone(), dy];
-                let dtable = b.fresh_value(table.ty.clone());
+                let dtable = self.b.fresh_value(table.ty.clone());
                 g.results = vec![dtable.clone()];
-                ops.push(g);
-                accumulate(&mut ops, &mut b, &mut adj, &table, dtable);
+                self.ops.push(g);
+                self.accumulate(&table, dtable);
             }
             "mlr.tmin" | "mlr.tmax" if op.operands.len() == 2 => {
                 // The winner of the comparison receives the gradient.
@@ -240,12 +429,12 @@ pub fn value_and_grad_of(f: &FuncOp, funcs: &[FuncOp]) -> (FuncOp, Vec<&'static 
                 let rhs = op.operands[1].clone();
                 let mut g_op = Op::new(grad);
                 g_op.operands = vec![lhs.clone(), rhs.clone(), dy];
-                let da = b.fresh_value(lhs.ty.clone());
-                let db = b.fresh_value(rhs.ty.clone());
+                let da = self.b.fresh_value(lhs.ty.clone());
+                let db = self.b.fresh_value(rhs.ty.clone());
                 g_op.results = vec![da.clone(), db.clone()];
-                ops.push(g_op);
-                accumulate(&mut ops, &mut b, &mut adj, &lhs, da);
-                accumulate(&mut ops, &mut b, &mut adj, &rhs, db);
+                self.ops.push(g_op);
+                self.accumulate(&lhs, da);
+                self.accumulate(&rhs, db);
             }
             "mlr.tmax" | "mlr.tmin" => {
                 // The reduction to one value: the largest (smallest) element
@@ -258,28 +447,29 @@ pub fn value_and_grad_of(f: &FuncOp, funcs: &[FuncOp]) -> (FuncOp, Vec<&'static 
                 };
                 let mut g_op = Op::new(grad);
                 g_op.operands = vec![x.clone(), dy];
-                let dx = b.fresh_value(x.ty.clone());
+                let dx = self.b.fresh_value(x.ty.clone());
                 g_op.results = vec![dx.clone()];
-                ops.push(g_op);
-                accumulate(&mut ops, &mut b, &mut adj, &x, dx);
+                self.ops.push(g_op);
+                self.accumulate(&x, dx);
             }
             "mlr.tclamp" => {
                 let x = op.operands[0].clone();
                 let mut g_op = Op::new("mlr.tclamp_grad");
-                g_op.operands = vec![x.clone(), op.operands[1].clone(), op.operands[2].clone(), dy];
-                let dx = b.fresh_value(x.ty.clone());
+                g_op.operands =
+                    vec![x.clone(), op.operands[1].clone(), op.operands[2].clone(), dy];
+                let dx = self.b.fresh_value(x.ty.clone());
                 g_op.results = vec![dx.clone()];
-                ops.push(g_op);
-                accumulate(&mut ops, &mut b, &mut adj, &x, dx);
+                self.ops.push(g_op);
+                self.accumulate(&x, dx);
             }
             "mlr.tpow" => {
                 let x = op.operands[0].clone();
                 let mut g_op = Op::new("mlr.tpow_grad");
                 g_op.operands = vec![x.clone(), op.operands[1].clone(), dy];
-                let dx = b.fresh_value(x.ty.clone());
+                let dx = self.b.fresh_value(x.ty.clone());
                 g_op.results = vec![dx.clone()];
-                ops.push(g_op);
-                accumulate(&mut ops, &mut b, &mut adj, &x, dx);
+                self.ops.push(g_op);
+                self.accumulate(&x, dx);
             }
             "mlr.texp" | "mlr.tln" => {
                 let x = op.operands[0].clone();
@@ -290,59 +480,55 @@ pub fn value_and_grad_of(f: &FuncOp, funcs: &[FuncOp]) -> (FuncOp, Vec<&'static 
                 };
                 let mut g_op = Op::new(grad);
                 g_op.operands = vec![x.clone(), dy];
-                let dx = b.fresh_value(x.ty.clone());
+                let dx = self.b.fresh_value(x.ty.clone());
                 g_op.results = vec![dx.clone()];
-                ops.push(g_op);
-                accumulate(&mut ops, &mut b, &mut adj, &x, dx);
+                self.ops.push(g_op);
+                self.accumulate(&x, dx);
             }
             "mlr.mean" => {
                 // The gradient of the mean is the gradient of the sum with
                 // the seed divided by the number of the elements.
-                used.push("mlr_sum_grad");
+                self.used.push("mlr_sum_grad");
                 let x = op.operands[0].clone();
-                let n = match &x.ty {
-                    Type::Tensor { shape, .. } | Type::MemRef { shape, .. } => shape
-                        .iter()
-                        .fold(1i64, |acc, d| match d {
-                            Dim::Static(v) => acc * v,
-                            Dim::Dynamic => acc,
-                        }),
-                    _ => 1,
-                };
+                let n = element_count(&x.ty);
                 let mut cst = Op::new("arith.constant");
                 cst.attrs.push(("value".into(), Attr::Float(n as f64)));
-                let cval = b.fresh_value(Type::Scalar(crate::ir::ScalarKind::F32));
+                let cval = self
+                    .b
+                    .fresh_value(Type::Scalar(crate::ir::ScalarKind::F32));
                 cst.results.push(cval.clone());
-                ops.push(cst);
+                self.ops.push(cst);
                 let mut div = Op::new("arith.divf");
                 div.operands = vec![dy, cval.clone()];
-                let seed = b.fresh_value(Type::Scalar(crate::ir::ScalarKind::F32));
+                let seed = self
+                    .b
+                    .fresh_value(Type::Scalar(crate::ir::ScalarKind::F32));
                 div.results.push(seed.clone());
-                ops.push(div);
+                self.ops.push(div);
                 let mut g_op = Op::new("mlr.sum_grad");
                 g_op.operands = vec![x.clone(), seed];
-                let dx = b.fresh_value(x.ty.clone());
+                let dx = self.b.fresh_value(x.ty.clone());
                 g_op.results = vec![dx.clone()];
-                ops.push(g_op);
-                accumulate(&mut ops, &mut b, &mut adj, &x, dx);
+                self.ops.push(g_op);
+                self.accumulate(&x, dx);
             }
             "mlr.norm1" => {
                 let x = op.operands[0].clone();
                 let mut g_op = Op::new("mlr.norm1_grad");
                 g_op.operands = vec![x.clone(), dy];
-                let dx = b.fresh_value(x.ty.clone());
+                let dx = self.b.fresh_value(x.ty.clone());
                 g_op.results = vec![dx.clone()];
-                ops.push(g_op);
-                accumulate(&mut ops, &mut b, &mut adj, &x, dx);
+                self.ops.push(g_op);
+                self.accumulate(&x, dx);
             }
             "mlr.norm2" => {
                 let x = op.operands[0].clone();
                 let mut g_op = Op::new("mlr.norm2_grad");
                 g_op.operands = vec![x.clone(), y.clone(), dy];
-                let dx = b.fresh_value(x.ty.clone());
+                let dx = self.b.fresh_value(x.ty.clone());
                 g_op.results = vec![dx.clone()];
-                ops.push(g_op);
-                accumulate(&mut ops, &mut b, &mut adj, &x, dx);
+                self.ops.push(g_op);
+                self.accumulate(&x, dx);
             }
             "mlr.var" | "mlr.std" => {
                 let x = op.operands[0].clone();
@@ -353,62 +539,58 @@ pub fn value_and_grad_of(f: &FuncOp, funcs: &[FuncOp]) -> (FuncOp, Vec<&'static 
                 };
                 let mut g_op = Op::new(grad);
                 g_op.operands = vec![x.clone(), dy];
-                let dx = b.fresh_value(x.ty.clone());
+                let dx = self.b.fresh_value(x.ty.clone());
                 g_op.results = vec![dx.clone()];
-                ops.push(g_op);
-                accumulate(&mut ops, &mut b, &mut adj, &x, dx);
+                self.ops.push(g_op);
+                self.accumulate(&x, dx);
             }
             "mlr.dot" => {
                 let lhs = op.operands[0].clone();
                 let rhs = op.operands[1].clone();
                 let mut g_op = Op::new("mlr.dot_grad");
                 g_op.operands = vec![lhs.clone(), rhs.clone(), dy];
-                let da = b.fresh_value(lhs.ty.clone());
-                let db = b.fresh_value(rhs.ty.clone());
+                let da = self.b.fresh_value(lhs.ty.clone());
+                let db = self.b.fresh_value(rhs.ty.clone());
                 g_op.results = vec![da.clone(), db.clone()];
-                ops.push(g_op);
-                accumulate(&mut ops, &mut b, &mut adj, &lhs, da);
-                accumulate(&mut ops, &mut b, &mut adj, &rhs, db);
+                self.ops.push(g_op);
+                self.accumulate(&lhs, da);
+                self.accumulate(&rhs, db);
             }
             "mlr.reshape" => {
                 // The inverse of the reshape is a copy of the original shape.
-                used.push("mlr_copy");
+                self.used.push("mlr_copy");
                 let x = op.operands[0].clone();
                 let mut g_op = Op::new("mlr.reshape_grad");
                 g_op.operands = vec![dy];
-                let dx = b.fresh_value(x.ty.clone());
+                let dx = self.b.fresh_value(x.ty.clone());
                 g_op.results = vec![dx.clone()];
-                ops.push(g_op);
-                accumulate(&mut ops, &mut b, &mut adj, &x, dx);
+                self.ops.push(g_op);
+                self.accumulate(&x, dx);
             }
             "mlr.concat" => {
                 let lhs = op.operands[0].clone();
                 let rhs = op.operands[1].clone();
                 let mut g_op = Op::new("mlr.concat_grad");
                 g_op.operands = vec![dy];
-                let da = b.fresh_value(lhs.ty.clone());
-                let db = b.fresh_value(rhs.ty.clone());
+                let da = self.b.fresh_value(lhs.ty.clone());
+                let db = self.b.fresh_value(rhs.ty.clone());
                 g_op.results = vec![da.clone(), db.clone()];
-                ops.push(g_op);
-                accumulate(&mut ops, &mut b, &mut adj, &lhs, da);
-                accumulate(&mut ops, &mut b, &mut adj, &rhs, db);
+                self.ops.push(g_op);
+                self.accumulate(&lhs, da);
+                self.accumulate(&rhs, db);
             }
             "mlr.rows" => {
                 let x = op.operands[0].clone();
                 let mut g_op = Op::new("mlr.rows_grad");
-                g_op.operands = vec![
-                    dy,
-                    op.operands[1].clone(),
-                    op.operands[2].clone(),
-                ];
-                let dx = b.fresh_value(x.ty.clone());
+                g_op.operands = vec![dy, op.operands[1].clone(), op.operands[2].clone()];
+                let dx = self.b.fresh_value(x.ty.clone());
                 g_op.results = vec![dx.clone()];
-                ops.push(g_op);
-                accumulate(&mut ops, &mut b, &mut adj, &x, dx);
+                self.ops.push(g_op);
+                self.accumulate(&x, dx);
             }
             "mlr.dropout" => {
                 // The mask is recomputed from the same seed and rate.
-                used.push("mlr_dropout_grad");
+                self.used.push("mlr_dropout_grad");
                 let x = op.operands[0].clone();
                 let mut g_op = Op::new("mlr.dropout_grad");
                 g_op.operands = vec![
@@ -417,53 +599,53 @@ pub fn value_and_grad_of(f: &FuncOp, funcs: &[FuncOp]) -> (FuncOp, Vec<&'static 
                     op.operands[1].clone(),
                     op.operands[2].clone(),
                 ];
-                let dx = b.fresh_value(x.ty.clone());
+                let dx = self.b.fresh_value(x.ty.clone());
                 g_op.results = vec![dx.clone()];
-                ops.push(g_op);
-                accumulate(&mut ops, &mut b, &mut adj, &x, dx);
+                self.ops.push(g_op);
+                self.accumulate(&x, dx);
             }
             "mlr.reverse" => {
                 // The reverse is its own inverse.
                 let x = op.operands[0].clone();
                 let mut g_op = Op::new("mlr.reverse");
                 g_op.operands = vec![dy];
-                let dx = b.fresh_value(x.ty.clone());
+                let dx = self.b.fresh_value(x.ty.clone());
                 g_op.results = vec![dx.clone()];
-                ops.push(g_op);
-                accumulate(&mut ops, &mut b, &mut adj, &x, dx);
+                self.ops.push(g_op);
+                self.accumulate(&x, dx);
             }
             "mlr.layernorm" => {
                 // dx, dg and db; the statistics are recomputed from x.
-                used.push("mlr_layernorm_grad");
+                self.used.push("mlr_layernorm_grad");
                 let x = op.operands[0].clone();
                 let g = op.operands[1].clone();
                 let bias = op.operands[2].clone();
                 let mut g_op = Op::new("mlr.layernorm_grad");
                 g_op.operands = vec![x.clone(), g.clone(), dy];
-                let dx = b.fresh_value(x.ty.clone());
-                let dg = b.fresh_value(g.ty.clone());
-                let db = b.fresh_value(bias.ty.clone());
+                let dx = self.b.fresh_value(x.ty.clone());
+                let dg = self.b.fresh_value(g.ty.clone());
+                let db = self.b.fresh_value(bias.ty.clone());
                 g_op.results = vec![dx.clone(), dg.clone(), db.clone()];
-                ops.push(g_op);
-                accumulate(&mut ops, &mut b, &mut adj, &x, dx);
-                accumulate(&mut ops, &mut b, &mut adj, &g, dg);
-                accumulate(&mut ops, &mut b, &mut adj, &bias, db);
+                self.ops.push(g_op);
+                self.accumulate(&x, dx);
+                self.accumulate(&g, dg);
+                self.accumulate(&bias, db);
             }
             "mlr.transpose" => {
                 // The adjoint of the transpose is the transpose.
                 let x = op.operands[0].clone();
                 let mut t = Op::new("mlr.transpose");
                 t.operands = vec![dy];
-                let dx = b.fresh_value(x.ty.clone());
+                let dx = self.b.fresh_value(x.ty.clone());
                 t.results = vec![dx.clone()];
-                ops.push(t);
-                accumulate(&mut ops, &mut b, &mut adj, &x, dx);
+                self.ops.push(t);
+                self.accumulate(&x, dx);
             }
             "mlr.softmax" | "mlr.softmax_tri" => {
                 // dx = y * (dy - sum(dy * y)) with y the output of the
                 // forward pass; the mask of the triangular version lives in
                 // the kernel.
-                used.push(if op.name == "mlr.softmax" {
+                self.used.push(if op.name == "mlr.softmax" {
                     "mlr_softmax_grad"
                 } else {
                     "mlr_softmax_tri_grad"
@@ -475,19 +657,19 @@ pub fn value_and_grad_of(f: &FuncOp, funcs: &[FuncOp]) -> (FuncOp, Vec<&'static 
                     "mlr.softmax_tri_grad"
                 };
                 let mut g_op = Op::new(name);
-                g_op.operands = vec![y, dy];
-                let dx = b.fresh_value(x.ty.clone());
+                g_op.operands = vec![y.clone(), dy];
+                let dx = self.b.fresh_value(x.ty.clone());
                 g_op.results = vec![dx.clone()];
-                ops.push(g_op);
-                accumulate(&mut ops, &mut b, &mut adj, &x, dx);
+                self.ops.push(g_op);
+                self.accumulate(&x, dx);
             }
             "mlr.add" => {
                 // Both operands receive the incoming gradient.
-                used.push("mlr_add_elem");
+                self.used.push("mlr_add_elem");
                 let lhs = op.operands[0].clone();
                 let rhs = op.operands[1].clone();
-                accumulate(&mut ops, &mut b, &mut adj, &lhs, dy.clone());
-                accumulate(&mut ops, &mut b, &mut adj, &rhs, dy);
+                self.accumulate(&lhs, dy.clone());
+                self.accumulate(&rhs, dy);
             }
             "mlr.map" => {
                 // An element wise function of one tensor.
@@ -497,10 +679,10 @@ pub fn value_and_grad_of(f: &FuncOp, funcs: &[FuncOp]) -> (FuncOp, Vec<&'static 
                     Some(grad) => {
                         let mut g_op = Op::new(grad);
                         g_op.operands = vec![x.clone(), dy];
-                        let dx = b.fresh_value(x.ty.clone());
+                        let dx = self.b.fresh_value(x.ty.clone());
                         g_op.results = vec![dx.clone()];
-                        ops.push(g_op);
-                        used.push(match grad {
+                        self.ops.push(g_op);
+                        self.used.push(match grad {
                             "mlr.gelu_grad" => "mlr_gelu_grad",
                             other => panic!("unknown gradient {other}"),
                         });
@@ -509,96 +691,157 @@ pub fn value_and_grad_of(f: &FuncOp, funcs: &[FuncOp]) -> (FuncOp, Vec<&'static 
                     // A linear map: `map(t) |v| v * 0.25`. The gradient of a
                     // linear function is the same function of the incoming
                     // gradient.
-                    None => linear_adjoint(&mut ops, &mut b, op, dy),
+                    None => {
+                        let scale = linear_scale(op).expect("a known linear map");
+                        map_scale(&mut self.ops, &mut self.b, dy, scale)
+                    }
                 };
-                accumulate(&mut ops, &mut b, &mut adj, &x, dx);
+                self.accumulate(&x, dx);
             }
             "mlr.cross_entropy" => {
                 // dlogits = (softmax(logits) - one hot(labels)) / rows.
-                used.push("mlr_cross_entropy_grad");
+                self.used.push("mlr_cross_entropy_grad");
                 let logits = op.operands[0].clone();
                 let labels = op.operands[1].clone();
                 let mut g = Op::new("mlr.cross_entropy_grad");
                 g.operands = vec![logits.clone(), labels.clone(), dy];
-                let dlogits = b.fresh_value(logits.ty.clone());
+                let dlogits = self.b.fresh_value(logits.ty.clone());
                 g.results = vec![dlogits.clone()];
                 g.loc = op.loc.clone();
-                ops.push(g);
-                accumulate(&mut ops, &mut b, &mut adj, &logits, dlogits);
+                self.ops.push(g);
+                self.accumulate(&logits, dlogits);
             }
-            "arith.constant" => {}
+            "tensor.extract" => {
+                // dt is the incoming gradient scattered into a zero tensor
+                // at the index.
+                let t = op.operands[0].clone();
+                let zeros = self.zero(&t.ty);
+                let mut ins = Op::new("tensor.insert");
+                ins.operands.push(dy);
+                ins.operands.push(zeros);
+                ins.operands.extend(op.operands[1..].iter().cloned());
+                let dt = self.b.fresh_value(t.ty.clone());
+                ins.results.push(dt.clone());
+                self.ops.push(ins);
+                self.accumulate(&t, dt);
+            }
+            "tensor.insert" => {
+                // dt is the incoming gradient with the written position
+                // removed; the written value receives it.
+                let t = op.operands[1].clone();
+                let v = op.operands[0].clone();
+                let mut zero = Op::new("arith.constant");
+                zero.attrs.push(("value".into(), Attr::Float(0.0)));
+                let zv = self
+                    .b
+                    .fresh_value(Type::Scalar(crate::ir::ScalarKind::F32));
+                zero.results.push(zv.clone());
+                self.ops.push(zero);
+                let mut ins = Op::new("tensor.insert");
+                ins.operands.push(zv);
+                ins.operands.push(dy.clone());
+                ins.operands.extend(op.operands[2..].iter().cloned());
+                let dt = self.b.fresh_value(t.ty.clone());
+                ins.results.push(dt.clone());
+                self.ops.push(ins);
+                let mut ext = Op::new("tensor.extract");
+                ext.operands.push(dy);
+                ext.operands.extend(op.operands[2..].iter().cloned());
+                let dv = self.b.fresh_value(v.ty.clone());
+                ext.results.push(dv.clone());
+                self.ops.push(ext);
+                self.accumulate(&t, dt);
+                self.accumulate(&v, dv);
+            }
+            "arith.constant" | "mlr.zeros" => {}
             // The scalar arithmetic on the way to the loss: the adjoints
             // are the usual ones, expressed with scalar operations.
             "arith.addf" => {
                 let lhs = op.operands[0].clone();
                 let rhs = op.operands[1].clone();
-                accumulate(&mut ops, &mut b, &mut adj, &lhs, dy.clone());
-                accumulate(&mut ops, &mut b, &mut adj, &rhs, dy);
+                self.accumulate(&lhs, dy.clone());
+                self.accumulate(&rhs, dy);
             }
             "arith.subf" => {
                 let lhs = op.operands[0].clone();
                 let rhs = op.operands[1].clone();
-                accumulate(&mut ops, &mut b, &mut adj, &lhs, dy.clone());
+                self.accumulate(&lhs, dy.clone());
                 let mut neg = Op::new("arith.negf");
                 neg.operands = vec![dy];
-                let ndy = b.fresh_value(Type::Scalar(crate::ir::ScalarKind::F32));
+                let ndy = self
+                    .b
+                    .fresh_value(Type::Scalar(crate::ir::ScalarKind::F32));
                 neg.results.push(ndy.clone());
-                ops.push(neg);
-                accumulate(&mut ops, &mut b, &mut adj, &rhs, ndy);
+                self.ops.push(neg);
+                self.accumulate(&rhs, ndy);
             }
             "arith.mulf" => {
                 let lhs = op.operands[0].clone();
                 let rhs = op.operands[1].clone();
                 let mut pa = Op::new("arith.mulf");
                 pa.operands = vec![dy.clone(), rhs.clone()];
-                let pva = b.fresh_value(Type::Scalar(crate::ir::ScalarKind::F32));
+                let pva = self
+                    .b
+                    .fresh_value(Type::Scalar(crate::ir::ScalarKind::F32));
                 pa.results.push(pva.clone());
-                ops.push(pa);
+                self.ops.push(pa);
                 let mut pb = Op::new("arith.mulf");
                 pb.operands = vec![dy.clone(), lhs.clone()];
-                let pvb = b.fresh_value(Type::Scalar(crate::ir::ScalarKind::F32));
+                let pvb = self
+                    .b
+                    .fresh_value(Type::Scalar(crate::ir::ScalarKind::F32));
                 pb.results.push(pvb.clone());
-                ops.push(pb);
-                accumulate(&mut ops, &mut b, &mut adj, &lhs, pva);
-                accumulate(&mut ops, &mut b, &mut adj, &rhs, pvb);
+                self.ops.push(pb);
+                self.accumulate(&lhs, pva);
+                self.accumulate(&rhs, pvb);
             }
             "arith.divf" => {
                 let lhs = op.operands[0].clone();
                 let rhs = op.operands[1].clone();
                 let mut da = Op::new("arith.divf");
                 da.operands = vec![dy.clone(), rhs.clone()];
-                let dva = b.fresh_value(Type::Scalar(crate::ir::ScalarKind::F32));
+                let dva = self
+                    .b
+                    .fresh_value(Type::Scalar(crate::ir::ScalarKind::F32));
                 da.results.push(dva.clone());
-                ops.push(da);
-                accumulate(&mut ops, &mut b, &mut adj, &lhs, dva);
+                self.ops.push(da);
+                self.accumulate(&lhs, dva);
                 let mut aa = Op::new("arith.mulf");
                 aa.operands = vec![dy.clone(), lhs.clone()];
-                let t = b.fresh_value(Type::Scalar(crate::ir::ScalarKind::F32));
+                let t = self
+                    .b
+                    .fresh_value(Type::Scalar(crate::ir::ScalarKind::F32));
                 aa.results.push(t.clone());
-                ops.push(aa);
+                self.ops.push(aa);
                 let mut bb = Op::new("arith.mulf");
                 bb.operands = vec![rhs.clone(), rhs.clone()];
-                let b2v = b.fresh_value(Type::Scalar(crate::ir::ScalarKind::F32));
+                let b2v = self
+                    .b
+                    .fresh_value(Type::Scalar(crate::ir::ScalarKind::F32));
                 bb.results.push(b2v.clone());
-                ops.push(bb);
+                self.ops.push(bb);
                 let mut db = Op::new("arith.divf");
                 db.operands = vec![t, b2v];
-                let ndy = b.fresh_value(Type::Scalar(crate::ir::ScalarKind::F32));
+                let ndy = self
+                    .b
+                    .fresh_value(Type::Scalar(crate::ir::ScalarKind::F32));
                 db.results.push(ndy.clone());
-                ops.push(db);
+                self.ops.push(db);
                 let mut neg = Op::new("arith.negf");
                 neg.operands = vec![ndy];
-                let nndy = b.fresh_value(Type::Scalar(crate::ir::ScalarKind::F32));
+                let nndy = self
+                    .b
+                    .fresh_value(Type::Scalar(crate::ir::ScalarKind::F32));
                 neg.results.push(nndy.clone());
-                ops.push(neg);
-                accumulate(&mut ops, &mut b, &mut adj, &rhs, nndy);
+                self.ops.push(neg);
+                self.accumulate(&rhs, nndy);
             }
             // The conversions of the scalars pass the gradient through.
             "arith.truncf" | "arith.extf" | "arith.sitofp" | "arith.index_cast"
             | "arith.trunci" | "arith.extui" => {
                 if let Some(a) = op.operands.first() {
                     let a = a.clone();
-                    accumulate(&mut ops, &mut b, &mut adj, &a, dy);
+                    self.accumulate(&a, dy);
                 }
             }
             other => panic!(
@@ -608,73 +851,433 @@ pub fn value_and_grad_of(f: &FuncOp, funcs: &[FuncOp]) -> (FuncOp, Vec<&'static 
         }
     }
 
-    // One result per tensor parameter: its gradient, or a zero tensor when
-    // the parameter does not reach the loss.
-    let mut results = vec![Type::Scalar(crate::ir::ScalarKind::F32)];
-    let mut returns = vec![loss];
-    for p in &f.params {
-        if !matches!(p.ty, Type::Tensor { .. }) {
-            continue;
+    /// The adjoint of an `scf.if`: each branch is reversed with the adjoint
+    /// of the result as the seed. A branch contributes to values from
+    /// outside it conditionally, so a *second* `scf.if` with the same
+    /// condition is appended after the backward chain so far, and its
+    /// branches report the contributions through one extra result per
+    /// outside value. (The regions of the original `if` cannot reference the
+    /// adjoints, which are defined after it.)
+    fn diff_if(&mut self, op: &Op, _index: usize) {
+        let dys: Vec<Option<Value>> = op
+            .results
+            .iter()
+            .map(|r| self.adj.get(&r.id).cloned())
+            .collect();
+        if dys.iter().all(|d| d.is_none()) {
+            // Nothing depends on any result of the `if`.
+            return;
         }
-        let grad = match adj.remove(&p.id) {
-            Some(v) => v,
-            None => {
-                let mut z = Op::new("mlr.zeros");
-                let zero = b.fresh_value(p.ty.clone());
-                z.results.push(zero.clone());
-                z.loc = f.loc.clone();
-                ops.push(z);
-                zero
+        // Reverse both branches, each into its own list of operations. The
+        // operations are copied with fresh ids: the values of the original
+        // region are not visible in the new one.
+        let mut reversed: Vec<(Vec<Op>, HashMap<usize, Value>, Vec<usize>)> = Vec::new();
+        for region in &op.regions {
+            let block = &region.blocks[0];
+            let mut map: HashMap<usize, Value> = HashMap::new();
+            let cloned: Vec<Op> = block.ops[..block.ops.len() - 1]
+                .iter()
+                .map(|o| clone_op(o, &mut map, &mut self.b))
+                .collect();
+            let saved_ops = std::mem::take(&mut self.ops);
+            let saved_local = self.local.take();
+            self.ops = Vec::new();
+            self.ops.extend(cloned.iter().cloned());
+            self.local = Some(Local {
+                defined: cloned
+                    .iter()
+                    .flat_map(|o| o.results.iter().map(|r| r.id))
+                    .collect(),
+                outer: HashMap::new(),
+                outer_order: Vec::new(),
+            });
+            // The seeds: the operands of the yield, which stand for the
+            // results of the `scf.if`.
+            let seeds: Vec<(Value, Value)> = block
+                .ops
+                .last()
+                .expect("a yield")
+                .operands
+                .iter()
+                .cloned()
+                .zip(dys.iter().cloned())
+                .filter_map(|(v, d)| d.map(|d| (v, d)))
+                .collect();
+            for (v, d) in seeds {
+                let target = map.get(&v.id).cloned().unwrap_or_else(|| v.clone());
+                self.seed(&target, d);
             }
-        };
-        results.push(grad.ty.clone());
-        returns.push(grad);
+            for o in cloned.iter().rev() {
+                let y = match o.results.first() {
+                    Some(r) => r.clone(),
+                    None => continue,
+                };
+                let dy = match self.adj.get(&y.id) {
+                    Some(v) => v.clone(),
+                    None => continue,
+                };
+                self.emit_adjoint(o, &y, &dy);
+            }
+            let local = self.local.take().unwrap();
+            self.local = saved_local;
+            let ops = std::mem::replace(&mut self.ops, saved_ops);
+            reversed.push((ops, local.outer, local.outer_order));
+        }
+        // The outside values that at least one branch contributed to, in a
+        // fixed order over both branches.
+        let mut order: Vec<(usize, Type)> = Vec::new();
+        for (_, outer, ids) in &reversed {
+            for id in ids {
+                if !order.iter().any(|(i, _)| i == id) {
+                    order.push((*id, outer[id].ty.clone()));
+                }
+            }
+        }
+        if order.is_empty() {
+            // The gradient stayed inside the branches; nothing to append.
+            return;
+        }
+        // The new `scf.if`: one result per outside value, and one yield
+        // operand per branch, which is the adjoint so far plus the
+        // contribution of the branch.
+        let mut new_op = Op::new("scf.if");
+        new_op.operands.push(op.operands[0].clone());
+        new_op.loc = op.loc.clone();
+        let extras: Vec<Value> = order
+            .iter()
+            .map(|(_, ty)| self.b.fresh_value(ty.clone()))
+            .collect();
+        new_op.results = extras.clone();
+        for (_r, (mut ops, outer, ids)) in reversed.into_iter().enumerate() {
+            let mut yields: Vec<Value> = Vec::new();
+            for (_i, (id, ty)) in order.iter().enumerate() {
+                let base = match self.adj.get(id) {
+                    Some(v) => v.clone(),
+                    None => zero_in(&mut ops, &mut self.b, ty),
+                };
+                let value = match ids.iter().position(|j| j == id) {
+                    Some(_) => {
+                        let contribution = outer[id].clone();
+                        let mut sum = Op::new("mlr.add");
+                        sum.operands = vec![base, contribution];
+                        let res = self.b.fresh_value(ty.clone());
+                        sum.results.push(res.clone());
+                        ops.push(sum);
+                        res
+                    }
+                    None => base,
+                };
+                yields.push(value);
+            }
+            let mut term = Op::new("scf.yield");
+            term.operands = yields;
+            ops.push(term);
+            new_op.regions.push(crate::ir::Region {
+                blocks: vec![crate::ir::Block { args: vec![], ops }],
+            });
+        }
+        self.ops.push(new_op.clone());
+        // The results of the new `if` are the new adjoints: the branches
+        // already added the adjoint so far.
+        for (i, (id, _)) in order.iter().enumerate() {
+            self.adj.insert(*id, extras[i].clone());
+        }
     }
 
-    let mut term = Op::new("func.return");
-    term.operands = returns;
-    ops.push(term);
-
-    let func = FuncOp {
-        name: format!("{}.value_and_grad", f.name),
-        params: f.params.clone(),
-        results,
-        body: crate::ir::Region {
-            blocks: vec![crate::ir::Block {
-                args: vec![],
-                ops,
-            }],
-        },
-        attrs: vec![(
-            "effects".to_string(),
-            Attr::Str("pure".to_string()),
-        )],
-        loc: f.loc.clone(),
-    };
-    (func, used)
+    /// The adjoint of an `scf.for` whose carried values are accumulated
+    /// (`yield acc + expr`): a backward loop over the same range that
+    /// replays the body, reverses it, and accumulates the contributions to
+    /// the values outside the loop into extra iter args.
+    fn diff_for(&mut self, op: &Op) {
+        let block = &op.regions[0].blocks[0];
+        let iv_fwd = block.args[0].clone();
+        let iter_args: Vec<Value> = block.args[1..].to_vec();
+        let body = &block.ops;
+        let yield_op = body.last().expect("a yield");
+        let inits: Vec<Value> = op.operands[3..].to_vec();
+        // The carried values that a gradient can flow through.
+        let tracked: Vec<usize> = (0..iter_args.len())
+            .filter(|k| is_differentiable_type(&iter_args[*k].ty))
+            .collect();
+        let dys: Vec<Option<Value>> = op
+            .results
+            .iter()
+            .map(|r| self.adj.get(&r.id).cloned())
+            .collect();
+        if !tracked.iter().any(|k| dys[*k].is_some()) {
+            // Nothing depends on any carried value.
+            return;
+        }
+        let defs: HashMap<usize, &Op> = body
+            .iter()
+            .flat_map(|o| o.results.iter().map(move |r| (r.id, o)))
+            .collect();
+        // The parts of the body that do not read the carried values: they
+        // are replayed inside the backward loop, which has no forward state.
+        let replay: Vec<Op> = body
+            .iter()
+            .filter(|o| o.name != "scf.yield" && !touches_arg(o, &iter_args, &defs))
+            .cloned()
+            .collect();
+        // The affine form of every tracked yield operand.
+        let mut visited: HashSet<usize> = HashSet::new();
+        let mut affines: Vec<Affine> = Vec::new();
+        for k in &tracked {
+            let aff = parse_affine(
+                &yield_op.operands[*k],
+                &iter_args[*k],
+                &iter_args,
+                &defs,
+                &mut visited,
+            )
+            .expect("validated by check_differentiable");
+            affines.push(aff);
+        }
+        // The backward loop: the same range; one iter arg per tracked
+        // carried value (its adjoint), plus one per outside value that the
+        // body contributes to.
+        let bwd_iv = self.b.fresh_value(Type::Index);
+        let dargs: Vec<Value> = tracked
+            .iter()
+            .map(|k| self.b.fresh_value(iter_args[*k].ty.clone()))
+            .collect();
+        // Replay the body with a fresh set of values; the induction variable
+        // of the backward loop stands for the forward one.
+        let mut map: HashMap<usize, Value> = HashMap::new();
+        map.insert(iv_fwd.id, bwd_iv.clone());
+        let replayed: Vec<Op> = replay
+            .iter()
+            .map(|o| clone_op(o, &mut map, &mut self.b))
+            .collect();
+        let saved_ops = std::mem::take(&mut self.ops);
+        let saved_local = self.local.take();
+        self.ops = Vec::new();
+        self.ops.extend(replayed.iter().cloned());
+        self.local = Some(Local {
+            defined: replayed
+                .iter()
+                .flat_map(|o| o.results.iter().map(|r| r.id))
+                .collect(),
+            outer: HashMap::new(),
+            outer_order: Vec::new(),
+        });
+        // The seeds: the affine terms of every tracked yield operand, each
+        // scaled by the incoming adjoint of the carried value.
+        for (j, (k, aff)) in tracked.iter().zip(affines.iter()).enumerate() {
+            let dy = match &dys[*k] {
+                Some(v) => v.clone(),
+                // The result is not used: its adjoint is zero and nothing
+                // flows through this chain.
+                None => continue,
+            };
+            for (scale, term) in &aff.terms {
+                let value = scaled(&mut self.ops, &mut self.b, dy.clone(), *scale);
+                let target = map
+                    .get(&term.id)
+                    .cloned()
+                    .unwrap_or_else(|| term.clone());
+                self.seed(&target, value);
+            }
+            let _ = j;
+        }
+        // The backward walk over the replayed operations.
+        for o in replayed.iter().rev() {
+            let y = match o.results.first() {
+                Some(r) => r.clone(),
+                None => continue,
+            };
+            let dy = match self.adj.get(&y.id) {
+                Some(v) => v.clone(),
+                None => continue,
+            };
+            self.emit_adjoint(o, &y, &dy);
+        }
+        let local = self.local.take().unwrap();
+        let mut region_ops = std::mem::replace(&mut self.ops, saved_ops);
+        self.local = saved_local;
+        // The outside accumulators of the backward loop.
+        let outer_args: Vec<Value> = local
+            .outer_order
+            .iter()
+            .map(|id| {
+                let ty = local.outer[id].ty.clone();
+                self.b.fresh_value(ty)
+            })
+            .collect();
+        // The yield: the scaled adjoints of the carried values, then the
+        // accumulated contributions to the outside values.
+        let mut yields: Vec<Value> = Vec::new();
+        for (j, (k, aff)) in tracked.iter().zip(affines.iter()).enumerate() {
+            let acc = dargs[j].clone();
+            let value = if aff.coeff == 1.0 {
+                acc
+            } else if aff.coeff == 0.0 {
+                zero_in(&mut region_ops, &mut self.b, &iter_args[*k].ty)
+            } else {
+                scaled(&mut region_ops, &mut self.b, acc, aff.coeff)
+            };
+            yields.push(value);
+        }
+        for (j, id) in local.outer_order.iter().enumerate() {
+            let acc = outer_args[j].clone();
+            let value = match local.outer.get(id) {
+                Some(v) => {
+                    let mut sum = Op::new("mlr.add");
+                    sum.operands = vec![acc, v.clone()];
+                    let res = self.b.fresh_value(sum.operands[0].ty.clone());
+                    sum.results.push(res.clone());
+                    region_ops.push(sum);
+                    res
+                }
+                None => acc,
+            };
+            yields.push(value);
+        }
+        let mut term = Op::new("scf.yield");
+        term.operands = yields;
+        region_ops.push(term);
+        // The initial values of the backward loop: the adjoints of the
+        // results, and zeros for the outside accumulators.
+        let mut operands = vec![
+            op.operands[0].clone(),
+            op.operands[1].clone(),
+            op.operands[2].clone(),
+        ];
+        for (k, dy) in tracked.iter().zip(dys.iter()) {
+            let init = match dy {
+                Some(v) => v.clone(),
+                None => self.zero(&iter_args[*k].ty),
+            };
+            operands.push(init);
+        }
+        for (j, _) in local.outer_order.iter().enumerate() {
+            let ty = outer_args[j].ty.clone();
+            let zero = self.zero(&ty);
+            operands.push(zero);
+        }
+        let mut for_op = Op::new("scf.for");
+        for_op.operands = operands;
+        for_op
+            .regions
+            .push(crate::ir::Region {
+                blocks: vec![crate::ir::Block {
+                    args: {
+                        let mut args = vec![bwd_iv];
+                        args.extend(dargs.iter().cloned());
+                        args.extend(outer_args.iter().cloned());
+                        args
+                    },
+                    ops: region_ops,
+                }],
+            });
+        for_op.results = {
+            let mut results: Vec<Value> = tracked
+                .iter()
+                .map(|k| self.b.fresh_value(iter_args[*k].ty.clone()))
+                .collect();
+            for a in &outer_args {
+                results.push(self.b.fresh_value(a.ty.clone()));
+            }
+            results
+        };
+        for_op.loc = op.loc.clone();
+        self.ops.push(for_op.clone());
+        // The gradient of the initial value of a carried value is the
+        // accumulated adjoint; the same for the outside values.
+        for (j, k) in tracked.iter().enumerate() {
+            if dys[*k].is_some() {
+                let res = for_op.results[j].clone();
+                self.accumulate(&inits[*k], res);
+            }
+        }
+        for (j, id) in local.outer_order.iter().enumerate() {
+            let ty = outer_args[j].ty.clone();
+            let target = Value {
+                id: *id,
+                ty,
+            };
+            let res = for_op.results[tracked.len() + j].clone();
+            self.accumulate(&target, res);
+        }
+    }
 }
 
-/// Adds a contribution to the adjoint of a value: the first one becomes the
-/// adjoint, the others are summed into it with `mlr.add`.
-fn accumulate(
-    ops: &mut Vec<Op>,
-    b: &mut Builder,
-    adj: &mut HashMap<usize, Value>,
-    target: &Value,
-    contribution: Value,
-) {
-    let new = match adj.get(&target.id) {
-        Some(old) => {
-            let mut sum = Op::new("mlr.add");
-            sum.operands = vec![old.clone(), contribution];
-            let res = b.fresh_value(old.ty.clone());
-            sum.results.push(res.clone());
-            ops.push(sum);
-            res
+/// A zero of the given type, appended to `ops`.
+fn zero_in(ops: &mut Vec<Op>, b: &mut Builder, ty: &Type) -> Value {
+    match ty {
+        Type::Tensor { .. } => {
+            let mut z = Op::new("mlr.zeros");
+            let zero = b.fresh_value(ty.clone());
+            z.results.push(zero.clone());
+            ops.push(z);
+            zero
         }
-        None => contribution,
-    };
-    adj.insert(target.id, new);
+        Type::Scalar(crate::ir::ScalarKind::F32) => {
+            let mut c = Op::new("arith.constant");
+            c.attrs.push(("value".into(), Attr::Float(0.0)));
+            let zero = b.fresh_value(ty.clone());
+            c.results.push(zero.clone());
+            ops.push(c);
+            zero
+        }
+        other => panic!("value_and_grad: no zero of the type {:?}", other),
+    }
+}
+
+/// The value scaled by a constant: itself for 1, a negation or a `map` for
+/// -1, a multiplication otherwise.
+fn scaled(ops: &mut Vec<Op>, b: &mut Builder, v: Value, scale: f64) -> Value {
+    if scale == 1.0 {
+        return v;
+    }
+    if scale == -1.0 {
+        if matches!(v.ty, Type::Tensor { .. }) {
+            return map_scale(ops, b, v, -1.0);
+        }
+        let mut neg = Op::new("arith.negf");
+        neg.operands = vec![v];
+        let res = b.fresh_value(Type::Scalar(crate::ir::ScalarKind::F32));
+        neg.results.push(res.clone());
+        ops.push(neg);
+        return res;
+    }
+    if matches!(v.ty, Type::Tensor { .. }) {
+        return map_scale(ops, b, v, scale);
+    }
+    let mut c = Op::new("arith.constant");
+    c.attrs.push(("value".into(), Attr::Float(scale)));
+    let cv = b.fresh_value(Type::Scalar(crate::ir::ScalarKind::F32));
+    c.results.push(cv.clone());
+    ops.push(c);
+    let mut mul = Op::new("arith.mulf");
+    mul.operands = vec![v, cv];
+    let res = b.fresh_value(Type::Scalar(crate::ir::ScalarKind::F32));
+    mul.results.push(res.clone());
+    ops.push(mul);
+    res
+}
+
+/// The number of the elements of a tensor type.
+fn element_count(ty: &Type) -> i64 {
+    match ty {
+        Type::Tensor { shape, .. } | Type::MemRef { shape, .. } => shape.iter().fold(
+            1i64,
+            |acc, d| match d {
+                Dim::Static(v) => acc * v,
+                Dim::Dynamic => acc,
+            },
+        ),
+        _ => 1,
+    }
+}
+
+/// Whether a gradient can flow through the type: f32 scalars and tensors.
+fn is_differentiable_type(ty: &Type) -> bool {
+    match ty {
+        Type::Scalar(crate::ir::ScalarKind::F32) => true,
+        Type::Tensor { elem, .. } => matches!(**elem, Type::Scalar(crate::ir::ScalarKind::F32)),
+        _ => false,
+    }
 }
 
 /// Replaces the calls of the pure functions of the program with their
@@ -790,15 +1393,6 @@ fn clone_op(op: &Op, map: &mut HashMap<usize, Value>, b: &mut Builder) -> Op {
     new
 }
 
-/// The gradient of a linear `map`: the body computes one arithmetic
-/// operation of the argument and a constant, and the gradient applies the
-/// scaling of the derivative to the incoming gradient.
-fn linear_adjoint(ops: &mut Vec<Op>, b: &mut Builder, op: &Op, dy: Value) -> Value {
-    // The operation of the body, and the constant on either side of it.
-    let scale = linear_scale(op).expect("a known linear map");
-    map_scale(ops, b, dy, scale)
-}
-
 /// The factor of the derivative of a linear `map`, if its body is one
 /// arithmetic operation of the argument and a constant.
 fn linear_scale(op: &Op) -> Option<f64> {
@@ -891,7 +1485,16 @@ fn elementwise_adjoint(op: &Op) -> Option<&'static str> {
 
 /// Verifies that a function can be differentiated.
 pub fn check_differentiable(f: &FuncOp, funcs: &[FuncOp]) -> Result<(), String> {
-    for op in &f.body.blocks[0].ops {
+    check_ops(&f.body.blocks[0].ops, funcs, true)
+}
+
+/// `top` is false inside the regions of an `if` or of a `for`, where no
+/// further control flow is supported.
+fn check_ops(ops: &[Op], funcs: &[FuncOp], top: bool) -> Result<(), String> {
+    for op in ops {
+        if op.name == "scf.yield" || op.name == "mlr.yield" || op.name == "func.return" {
+            continue;
+        }
         if op.name == "func.call" {
             if let Some(Attr::Str(callee)) = op.attr("callee") {
                 if !callee.starts_with("mlr_") {
@@ -904,29 +1507,268 @@ pub fn check_differentiable(f: &FuncOp, funcs: &[FuncOp]) -> Result<(), String> 
                 }
             }
         }
-        if !FORWARD.contains(&op.name.as_str()) {
-            return Err(format!(
-                "the operation `{}` has no gradient yet",
-                op.name
-            ));
-        }
-        if op.name == "mlr.map" {
-            if elementwise_adjoint(op).is_none() && linear_scale(op).is_none() {
-                return Err(
-                    "the gradient of this `map` is not known; only \
-                     `map(t) |v| { yield gelu(v) }` can be differentiated"
-                        .to_string(),
-                );
+        match op.name.as_str() {
+            "scf.if" => {
+                if !top {
+                    return Err("nested control flow cannot be differentiated yet".to_string());
+                }
+                if op.results.is_empty() {
+                    return Err("an `if` without a value cannot be differentiated".to_string());
+                }
+                for region in &op.regions {
+                    check_ops(&region.blocks[0].ops, funcs, false)?;
+                }
             }
-            continue;
+            "scf.for" => {
+                if !top {
+                    return Err("nested control flow cannot be differentiated yet".to_string());
+                }
+                check_for(op)?;
+            }
+            _ => check_straight_op(op)?,
         }
-        if !op.regions.is_empty() {
+    }
+    Ok(())
+}
+
+/// One straight-line operation: it must have a known adjoint, and a `map`
+/// must be a known element wise function or a linear one.
+fn check_straight_op(op: &Op) -> Result<(), String> {
+    if !FORWARD.contains(&op.name.as_str()) {
+        return Err(format!("the operation `{}` has no gradient yet", op.name));
+    }
+    if op.name == "mlr.map" && elementwise_adjoint(op).is_none() && linear_scale(op).is_none() {
+        return Err(
+            "the gradient of this `map` is not known; only \
+             `map(t) |v| { yield gelu(v) }` can be differentiated"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
+/// A loop can be differentiated when its carried values are only
+/// accumulated: every use of an iter arg is a linear `yield acc + expr`
+/// (also `-` and a constant factor), and the rest of the body does not read
+/// the carried values at all.
+fn check_for(op: &Op) -> Result<(), String> {
+    let block = &op.regions[0].blocks[0];
+    let iter_args = &block.args[1..];
+    let body = &block.ops;
+    let yield_op = body
+        .last()
+        .filter(|o| o.name == "scf.yield")
+        .ok_or_else(|| "the loop has no yield".to_string())?;
+    if yield_op.operands.len() != iter_args.len() {
+        return Err("the loop does not yield one value per carried value".to_string());
+    }
+    let defs: HashMap<usize, &Op> = body
+        .iter()
+        .flat_map(|o| o.results.iter().map(move |r| (r.id, o)))
+        .collect();
+    let mut visited: HashSet<usize> = HashSet::new();
+    for (operand, arg) in yield_op.operands.iter().zip(iter_args.iter()) {
+        let aff = parse_affine(operand, arg, iter_args, &defs, &mut visited)?;
+        if matches!(arg.ty, Type::Tensor { .. })
+            && aff.coeff != 0.0
+            && aff.coeff != 1.0
+            && aff.coeff != -1.0
+        {
             return Err(
-                "the function has a region (`for` or `if`), which cannot \
-                 be differentiated yet"
+                "a tensor can only be accumulated with the factor 1: \
+                 `yield acc + expr`"
                     .to_string(),
             );
         }
     }
+    // Every operation that the parses did not visit must be free of the
+    // carried values; those are replayed and reversed by the backward loop.
+    for o in body {
+        if o.name == "scf.yield" {
+            continue;
+        }
+        if touches_arg(o, iter_args, &defs) {
+            let covered = o.results.iter().all(|r| visited.contains(&r.id));
+            if !covered {
+                return Err(
+                    "the carried values of the loop may only be read by the \
+                     accumulation in `yield`: `yield acc + expr`"
+                        .to_string(),
+                );
+            }
+        } else {
+            check_straight_op(o)?;
+        }
+    }
     Ok(())
+}
+
+/// One operand of a yield, parsed as `coeff * arg + sum(scale * term)`.
+struct Affine {
+    coeff: f64,
+    terms: Vec<(f64, Value)>,
+    /// Whether the parsed value reads the carried value at all.
+    touched: bool,
+}
+
+fn parse_affine(
+    v: &Value,
+    arg: &Value,
+    args: &[Value],
+    defs: &HashMap<usize, &Op>,
+    visited: &mut HashSet<usize>,
+) -> Result<Affine, String> {
+    if v.id == arg.id {
+        return Ok(Affine {
+            coeff: 1.0,
+            terms: Vec::new(),
+            touched: true,
+        });
+    }
+    if args.iter().any(|a| a.id == v.id) {
+        return Err(
+            "each `yield` operand may only accumulate one carried value".to_string()
+        );
+    }
+    let op = match defs.get(&v.id) {
+        Some(op) => *op,
+        // A value from outside the loop.
+        None => {
+            return Ok(Affine {
+                coeff: 0.0,
+                terms: vec![(1.0, v.clone())],
+                touched: false,
+            });
+        }
+    };
+    visited.insert(v.id);
+    match op.name.as_str() {
+        "arith.constant" => Ok(Affine {
+            coeff: 0.0,
+            terms: vec![(1.0, v.clone())],
+            touched: false,
+        }),
+        "arith.addf" | "arith.subf" => {
+            let minus = op.name == "arith.subf";
+            let a = parse_affine(&op.operands[0], arg, args, defs, visited)?;
+            let b = parse_affine(&op.operands[1], arg, args, defs, visited)?;
+            let mut coeff = a.coeff;
+            let mut terms = a.terms;
+            for (s, t) in b.terms {
+                terms.push((if minus { -s } else { s }, t));
+            }
+            if minus {
+                coeff -= b.coeff;
+            } else {
+                coeff += b.coeff;
+            }
+            Ok(Affine {
+                coeff,
+                terms,
+                touched: a.touched || b.touched,
+            })
+        }
+        "arith.mulf" => {
+            let a = parse_affine(&op.operands[0], arg, args, defs, visited)?;
+            let b = parse_affine(&op.operands[1], arg, args, defs, visited)?;
+            match (a.touched, b.touched) {
+                (true, true) => Err(
+                    "the carried value may only be multiplied by a constant"
+                        .to_string(),
+                ),
+                (true, false) => {
+                    let c = constant_of(&b, defs)
+                        .ok_or_else(|| {
+                            "the carried value may only be multiplied by a constant"
+                                .to_string()
+                        })?;
+                    let terms = a
+                        .terms
+                        .into_iter()
+                        .map(|(s, t)| (s * c, t))
+                        .collect();
+                    Ok(Affine {
+                        coeff: a.coeff * c,
+                        terms,
+                        touched: true,
+                    })
+                }
+                (false, true) => {
+                    let c = constant_of(&a, defs).ok_or_else(|| {
+                        "the carried value may only be multiplied by a constant"
+                            .to_string()
+                    })?;
+                    let terms = b
+                        .terms
+                        .into_iter()
+                        .map(|(s, t)| (s * c, t))
+                        .collect();
+                    Ok(Affine {
+                        coeff: b.coeff * c,
+                        terms,
+                        touched: true,
+                    })
+                }
+                (false, false) => Ok(Affine {
+                    coeff: 0.0,
+                    terms: vec![(1.0, v.clone())],
+                    touched: false,
+                }),
+            }
+        }
+        _ => {
+            if touches_arg(op, args, defs) {
+                return Err(
+                    "the carried values of the loop may only be read by the \
+                     accumulation in `yield`: `yield acc + expr`"
+                        .to_string(),
+                );
+            }
+            Ok(Affine {
+                coeff: 0.0,
+                terms: vec![(1.0, v.clone())],
+                touched: false,
+            })
+        }
+    }
+}
+
+/// The constant value of an affine form that is a single unscaled constant.
+fn constant_of(aff: &Affine, defs: &HashMap<usize, &Op>) -> Option<f64> {
+    if aff.coeff != 0.0 || aff.terms.len() != 1 || aff.terms[0].0 != 1.0 {
+        return None;
+    }
+    let op = defs.get(&aff.terms[0].1.id)?;
+    if op.name != "arith.constant" {
+        return None;
+    }
+    match op.attr("value") {
+        Some(Attr::Float(v)) => Some(*v),
+        Some(Attr::Int(v)) => Some(*v as f64),
+        _ => None,
+    }
+}
+
+/// Whether the operation reads one of the carried values, directly or
+/// through the operations of the block that define its operands.
+fn touches_arg(op: &Op, args: &[Value], defs: &HashMap<usize, &Op>) -> bool {
+    let mut seen: HashSet<usize> = HashSet::new();
+    fn walk(
+        v: &Value,
+        args: &[Value],
+        defs: &HashMap<usize, &Op>,
+        seen: &mut HashSet<usize>,
+    ) -> bool {
+        if args.iter().any(|a| a.id == v.id) {
+            return true;
+        }
+        if !seen.insert(v.id) {
+            return false;
+        }
+        match defs.get(&v.id) {
+            Some(op) => op.operands.iter().any(|o| walk(o, args, defs, seen)),
+            None => false,
+        }
+    }
+    op.operands.iter().any(|o| walk(o, args, defs, &mut seen))
 }

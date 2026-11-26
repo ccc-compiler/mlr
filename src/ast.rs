@@ -11,6 +11,9 @@ use crate::lexer::Span;
 #[derive(Clone, Debug, PartialEq)]
 pub enum SrcDim {
     Static(i64),
+    /// A named dimension, bound by the type parameters of a generic
+    /// function (`fn f<N: i64>(x: Tensor<Nxf32>)`).
+    Named(String),
     Dynamic,
 }
 
@@ -24,6 +27,8 @@ pub enum SrcType {
     },
     /// The name of a struct.
     Named(String),
+    /// A shape constant in the type arguments of a call: `f<4>(x)`.
+    Const(i64),
 }
 
 impl SrcType {
@@ -43,6 +48,7 @@ impl SrcType {
                         }
                         match d {
                             SrcDim::Static(v) => s.push_str(&v.to_string()),
+                            SrcDim::Named(n) => s.push_str(n),
                             SrcDim::Dynamic => s.push('?'),
                         }
                     }
@@ -53,6 +59,7 @@ impl SrcType {
                 s
             }
             SrcType::Named(name) => name.clone(),
+            SrcType::Const(v) => v.to_string(),
         }
     }
 }
@@ -273,6 +280,9 @@ pub struct LetMulti {
 #[derive(Clone, Debug)]
 pub struct Func {
     pub name: String,
+    /// The type parameters: `fn f<N: i64>(...)`. Only shape constants are
+    /// supported; the function is monomorphized per instantiation.
+    pub type_params: Vec<(String, Span)>,
     pub params: Vec<Param>,
     pub ret: Option<SrcType>,
     pub body: Block,
@@ -298,7 +308,18 @@ pub struct ImplBlock {
 
 #[derive(Clone, Debug, Default)]
 pub struct Program {
+    /// The files that were pulled in with `use "path.mlr"`.
+    pub uses: Vec<Use>,
     pub structs: Vec<StructDef>,
     pub impls: Vec<ImplBlock>,
     pub funcs: Vec<Func>,
+}
+
+/// `use "relative/path.mlr"`: the declarations of another file, merged into
+/// a flat namespace.
+#[derive(Clone, Debug)]
+pub struct Use {
+    pub path: String,
+    #[allow(dead_code)]
+    pub span: Span,
 }

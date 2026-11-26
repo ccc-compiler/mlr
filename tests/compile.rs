@@ -1,10 +1,42 @@
 //! Integration tests: compile MLR programs, check the generated MLIR and run
 //! the programs end to end.
 
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Mutex, OnceLock};
+
+/// Guards the end-to-end runs: each one spawns the compiler and the LLVM
+/// tool chain, and on a small machine the tests in parallel run out of
+/// memory (`Killed: 9`) before they finish.
+fn e2e_lock() -> &'static Mutex<()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+}
 
 static COUNTER: AtomicUsize = AtomicUsize::new(0);
+
+/// Whether the external LLVM tool chain that the run scripts need is present.
+///
+/// This is deliberately separate from "did the program run": a missing tool
+/// chain is a skip, a failed run is always a test failure.
+fn tools_available() -> bool {
+    static AVAILABLE: OnceLock<bool> = OnceLock::new();
+    *AVAILABLE.get_or_init(|| {
+        ["mlir-opt", "mlir-translate", "clang"].iter().all(|tool| {
+            Command::new(tool)
+                .arg("--version")
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .is_ok()
+        })
+    })
+}
+
+/// In CI the tool chain must be present; locally its absence is a skip.
+fn require_e2e() -> bool {
+    std::env::var_os("MLR_REQUIRE_E2E").is_some()
+}
 
 fn tmp_dir() -> std::path::PathBuf {
     let n = COUNTER.fetch_add(1, Ordering::SeqCst);
@@ -80,7 +112,12 @@ fn verify_mlir(mlir: &str) {
             mlir,
             String::from_utf8_lossy(&out.stderr)
         ),
-        Err(_) => eprintln!("skipping MLIR verification: mlir-opt not found"),
+        Err(_) => {
+            if require_e2e() {
+                panic!("MLR_REQUIRE_E2E is set but mlir-opt was not found");
+            }
+            eprintln!("skipping MLIR verification: mlir-opt not found");
+        }
     }
 }
 
@@ -100,21 +137,44 @@ fn run(src: &str) -> Option<String> {
         "compilation failed:\n{}",
         String::from_utf8_lossy(&out.stderr)
     );
-    // The full lowering to native code needs the LLVM tool chain; the tests
-    // only run when it is available.
     let script = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("scripts/run.sh");
+    run_script_file(&script, &input)
+}
+
+/// Runs one of the `scripts/run*.sh` scripts on `input`.
+///
+/// Returns `None` only when the tool chain is genuinely unavailable (and
+/// `MLR_REQUIRE_E2E` is unset). A non-zero exit while the tools are present is
+/// a real failure and panics, so end-to-end breakage can no longer be silently
+/// skipped.
+fn run_script_file(script: &std::path::Path, input: &std::path::Path) -> Option<String> {
     if !script.exists() {
+        if require_e2e() {
+            panic!("MLR_REQUIRE_E2E is set but `{}` is missing", script.display());
+        }
+        eprintln!("skipping: `{}` is missing", script.display());
         return None;
     }
+    if !tools_available() {
+        if require_e2e() {
+            panic!("MLR_REQUIRE_E2E is set but mlir-opt/mlir-translate/clang are missing");
+        }
+        eprintln!("skipping: the LLVM tool chain is not available");
+        return None;
+    }
+    let _guard = e2e_lock().lock().unwrap_or_else(|e| e.into_inner());
     let out = Command::new("sh")
-        .arg(&script)
-        .arg(&input)
+        .arg(script)
+        .arg(input)
         .output()
         .expect("failed to run the script");
-    if !out.status.success() {
-        return None;
-    }
-    Some(String::from_utf8(out.stdout).unwrap())
+    assert!(
+        out.status.success(),
+        "the program failed to lower or run:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    Some(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
 // ---------------------------------------------------------------------------
@@ -233,6 +293,26 @@ fn pure_fn(a: i32) -> i32 {
 fn rejects_type_errors() {
     let err = compile_err("fn main() { let x: i32 = 1.5 }");
     assert!(err.contains("error"), "{}", err);
+}
+
+#[test]
+fn reports_errors_of_every_function() {
+    // Three broken functions: the checker must not stop at the first one.
+    let err = compile_err(
+        r#"
+fn a() { yield nope }
+fn b() { let x: i32 = true }
+fn c() { yield undefined_too }
+"#,
+    );
+    assert!(err.contains("undefined variable `nope`"), "{}", err);
+    assert!(err.contains("undefined variable `undefined_too`"), "{}", err);
+    assert!(err.contains("cannot initialize `x`"), "{}", err);
+    // The errors are reported in source order.
+    let nope = err.find("undefined variable `nope`").unwrap();
+    let init = err.find("cannot initialize `x`").unwrap();
+    let undef = err.find("undefined variable `undefined_too`").unwrap();
+    assert!(nope < init && init < undef, "{}", err);
 }
 
 #[test]
@@ -356,23 +436,7 @@ fn main() {
 /// Compiles a file in the repository with the given script.
 fn run_script(script: &str, file: &str) -> Option<String> {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
-    let script = root.join(script);
-    if !script.exists() {
-        return None;
-    }
-    let out = Command::new("sh")
-        .arg(&script)
-        .arg(root.join(file))
-        .output()
-        .expect("failed to run the script");
-    if !out.status.success() {
-        eprintln!(
-            "skipping: the script failed:\n{}",
-            String::from_utf8_lossy(&out.stderr)
-        );
-        return None;
-    }
-    Some(String::from_utf8(out.stdout).unwrap())
+    run_script_file(&root.join(script), &root.join(file))
 }
 
 #[test]
@@ -794,6 +858,253 @@ fn main() {
 }
 
 #[test]
+fn differentiates_a_loop() {
+    // loss = sum_i w[i] * x[i]; the gradient is exactly the other tensor.
+    let dir = tmp_dir();
+    let w = dir.join("w.bin");
+    let x = dir.join("x.bin");
+    std::fs::write(&w, [1.0f32, 2.0, 3.0, 4.0].map(|v| v.to_le_bytes()).concat()).unwrap();
+    std::fs::write(&x, [10.0f32, 20.0, 30.0, 40.0].map(|v| v.to_le_bytes()).concat()).unwrap();
+    let Some(out) = run(&format!(
+        r#"
+fn loss(w: Tensor<4xf32>, x: Tensor<4xf32>) -> f32 {{
+    let zero: f32 = 0.0
+    let total = for i in 0..4 step 1 iter(acc = zero) {{
+        yield acc + tensor.extract(w, [i]) * tensor.extract(x, [i])
+    }}
+    yield total
+}}
+
+fn main() {{
+    let w = mlr.load<Tensor<4xf32>>("{}")
+    let x = mlr.load<Tensor<4xf32>>("{}")
+    let (l, dw, dx) = value_and_grad(loss, w, x)
+    print(l)
+    print(tensor.extract(dw, [0]))
+    print(tensor.extract(dw, [3]))
+    print(tensor.extract(dx, [1]))
+}}
+"#,
+        w.display(),
+        x.display()
+    )) else {
+        eprintln!("skipping: the LLVM tool chain is not available");
+        return;
+    };
+    assert_eq!(
+        out.lines().collect::<Vec<_>>(),
+        vec!["300.000000", "10.000000", "40.000000", "2.000000"]
+    );
+}
+
+#[test]
+fn differentiates_an_if() {
+    let dir = tmp_dir();
+    let w1 = dir.join("w1.bin");
+    let w2 = dir.join("w2.bin");
+    std::fs::write(&w1, [1.0f32, 5.0].map(|v| v.to_le_bytes()).concat()).unwrap();
+    std::fs::write(&w2, [5.0f32, 1.0].map(|v| v.to_le_bytes()).concat()).unwrap();
+    let Some(out) = run(&format!(
+        r#"
+fn loss(w: Tensor<2xf32>) -> f32 {{
+    let a = tensor.extract(w, [0])
+    let b = tensor.extract(w, [1])
+    let l = if a > b {{
+        yield a * 2.0
+    }} else {{
+        yield b * 3.0
+    }}
+    yield l
+}}
+
+fn main() {{
+    let w1 = mlr.load<Tensor<2xf32>>("{}")
+    let w2 = mlr.load<Tensor<2xf32>>("{}")
+    let (l1, dw1) = value_and_grad(loss, w1)
+    let (l2, dw2) = value_and_grad(loss, w2)
+    print(l1)
+    print(tensor.extract(dw1, [0]))
+    print(tensor.extract(dw1, [1]))
+    print(l2)
+    print(tensor.extract(dw2, [0]))
+    print(tensor.extract(dw2, [1]))
+}}
+"#,
+        w1.display(),
+        w2.display()
+    )) else {
+        eprintln!("skipping: the LLVM tool chain is not available");
+        return;
+    };
+    // w1 = [1, 5]: the else branch (b * 3); w2 = [5, 1]: the then (a * 2).
+    assert_eq!(
+        out.lines().collect::<Vec<_>>(),
+        vec!["15.000000", "0.000000", "3.000000", "10.000000", "2.000000", "0.000000"]
+    );
+}
+
+#[test]
+fn rejects_a_loop_that_uses_its_carried_value_nonlinearly() {
+    let err = compile_err(
+        r#"
+fn loss(w: Tensor<4xf32>) -> f32 {
+    let zero: f32 = 0.0
+    let total = for i in 0..4 step 1 iter(acc = zero) {
+        yield acc * tensor.extract(w, [i])
+    }
+    yield total
+}
+
+fn main() {
+    let w = tensor.zeros<Tensor<4xf32>>()
+    let (l, dw) = value_and_grad(loss, w)
+    print(l)
+}
+"#,
+    );
+    assert!(err.contains("cannot be differentiated"), "{}", err);
+    assert!(err.contains("multiplied by a constant"), "{}", err);
+}
+
+#[test]
+fn pulls_in_another_file_with_use() {
+    let Some(out) = run_script("scripts/run.sh", "examples/modules/use_struct.mlr") else {
+        eprintln!("skipping: the LLVM tool chain is not available");
+        return;
+    };
+    // dot([1, 2], [3, 4]) = 11.
+    assert_eq!(out.trim(), "11.000000");
+}
+
+#[test]
+fn instantiates_a_generic_function() {
+    let Some(out) = run_script("scripts/run.sh", "examples/modules/generic.mlr") else {
+        eprintln!("skipping: the LLVM tool chain is not available");
+        return;
+    };
+    // filled<4>(2.0)[3] = 2; sum([2,2,2,2] * [0.5,..]) = 4; sum(filled<3>(10)) = 30.
+    assert_eq!(out.lines().collect::<Vec<_>>(), vec!["2.000000", "4.000000", "30.000000"]);
+}
+
+#[test]
+fn reports_a_use_of_a_missing_file_and_a_circular_use() {
+    let err = compile_err(
+        r#"
+use "no/such/file.mlr"
+
+fn main() {
+    print(1)
+}
+"#,
+    );
+    assert!(err.contains("cannot read"), "{}", err);
+}
+
+#[test]
+fn rejects_a_generic_call_without_shape_arguments() {
+    let err = compile_err(
+        r#"
+fn filled<N: i64>(v: f32) -> Tensor<Nxf32> {
+    let t = tensor.zeros<Tensor<Nxf32>>()
+    let out = for i in 0..N step 1 iter(t = t) {
+        yield tensor.insert(t, [i], v)
+    }
+    yield out
+}
+
+fn main() {
+    let a = filled(2.0)
+    print(tensor.extract(a, [0]))
+}
+"#,
+    );
+    assert!(err.contains("shape argument"), "{}", err);
+}
+
+#[test]
+fn reduces_and_reorders_along_an_axis() {
+    // A 3x3 matrix; every printed value follows from the rows
+    // [3,1,2], [9,7,8] and [5,6,4].
+    let dir = tmp_dir();
+    let mat = dir.join("mat.bin");
+    std::fs::write(
+        &mat,
+        [3.0f32, 1.0, 2.0, 9.0, 7.0, 8.0, 5.0, 6.0, 4.0]
+            .map(|v| v.to_le_bytes())
+            .concat(),
+    )
+    .unwrap();
+    let Some(out) = run(&format!(
+        r#"
+fn main() {{
+    let m = mlr.load<Tensor<3x3xf32>>("{}")
+    let s = sum_axis(m, 1)
+    print(tensor.extract(s, [0]))
+    print(tensor.extract(s, [1]))
+    let mx = tmax_axis(m, 0)
+    print(tensor.extract(mx, [0]))
+    let am = argmin_axis(m, 1)
+    print(tensor.extract(am, [0]))
+    let srt = sort(m)
+    print(tensor.extract(srt, [0, 0]))
+    print(tensor.extract(srt, [2, 0]))
+    let a = argsort(m)
+    print(tensor.extract(a, [0, 0]))
+    let c = cumsum(m)
+    print(tensor.extract(c, [0, 2]))
+    let me = mean_axis(m, 1)
+    print(tensor.extract(me, [0]))
+}}
+"#,
+        mat.display()
+    )) else {
+        eprintln!("skipping: the LLVM tool chain is not available");
+        return;
+    };
+    assert_eq!(
+        out.lines().collect::<Vec<_>>(),
+        vec![
+            "6.000000", "24.000000", "9.000000", "1", "1.000000", "4.000000", "1", "6.000000",
+            "2.000000"
+        ]
+    );
+}
+
+#[test]
+fn loads_rows_of_a_raw_file_at_runtime() {
+    // A raw tensor (magic, rank, dims, values) with 4 rows of 5; the batch
+    // reads the last two of them.
+    let dir = tmp_dir();
+    let batch = dir.join("batch.bin");
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(b"MLRRWT01");
+    bytes.extend_from_slice(&2i64.to_le_bytes());
+    bytes.extend_from_slice(&4i64.to_le_bytes());
+    bytes.extend_from_slice(&5i64.to_le_bytes());
+    for v in 1..=20 {
+        bytes.extend_from_slice(&(v as f32).to_le_bytes());
+    }
+    std::fs::write(&batch, &bytes).unwrap();
+    let Some(out) = run(&format!(
+        r#"
+fn main() {{
+    let b = mlr.load_batch<Tensor<2x5xf32>>("{}", 2)
+    print(tensor.extract(b, [0, 0]))
+    print(tensor.extract(b, [1, 4]))
+    let r = mlr.load_runtime<Tensor<4x5xf32>>("{}")
+    print(tensor.extract(r, [0, 0]))
+}}
+"#,
+        batch.display(),
+        batch.display()
+    )) else {
+        eprintln!("skipping: the LLVM tool chain is not available");
+        return;
+    };
+    assert_eq!(out.lines().collect::<Vec<_>>(), vec!["11.000000", "20.000000", "1.000000"]);
+}
+
+#[test]
 fn uses_the_random_functions_of_the_library() {
     let Some(out) = run(
         r#"
@@ -980,6 +1291,10 @@ fn runs_the_mnist_example_on_the_cpu() {
 
 #[test]
 fn runs_the_mnist_example_on_the_gpu() {
+    if !cfg!(target_os = "macos") {
+        eprintln!("skipping: the Metal Performance Shaders are macOS only");
+        return;
+    }
     let Some(out) = run_script("scripts/run_mps.sh", "examples/mnist/mnist.mlr") else {
         eprintln!("skipping: the Metal Performance Shaders are not available");
         return;

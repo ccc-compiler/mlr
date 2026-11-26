@@ -6,6 +6,7 @@ pub mod build;
 pub mod check;
 pub mod ir;
 pub mod lexer;
+pub mod module;
 pub mod parser;
 pub mod passes;
 pub mod pt;

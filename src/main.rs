@@ -10,6 +10,7 @@ mod build;
 mod check;
 mod ir;
 mod lexer;
+mod module;
 mod parser;
 mod passes;
 mod pt;
@@ -92,15 +93,7 @@ fn main() -> ExitCode {
         }
     };
 
-    let src = match std::fs::read_to_string(&path) {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("mlr: error: cannot read `{}`: {}", path, e);
-            return ExitCode::FAILURE;
-        }
-    };
-
-    let prog = match parser::parse(&src) {
+    let prog = match module::load(std::path::Path::new(&path)) {
         Ok(p) => p,
         Err(e) => {
             eprintln!("{}", e);
@@ -108,10 +101,12 @@ fn main() -> ExitCode {
         }
     };
 
-    let typed = match check::check(&prog) {
+    let typed = match check::check_all(&prog) {
         Ok(t) => t,
-        Err(e) => {
-            eprintln!("{}", e);
+        Err(errs) => {
+            for e in errs {
+                eprintln!("{}", e);
+            }
             return ExitCode::FAILURE;
         }
     };

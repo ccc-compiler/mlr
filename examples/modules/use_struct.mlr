@@ -1,0 +1,7 @@
+use "geom.mlr"
+
+fn main() {
+    let a = Vec2 { x: 1.0, y: 2.0 }
+    let b = Vec2 { x: 3.0, y: 4.0 }
+    print(dot(a, b))
+}

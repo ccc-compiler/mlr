@@ -37,20 +37,102 @@ float mlr_tanh(float x) { return tanhf(x); }
 float mlr_sigmoid(float x) { return 1.0f / (1.0f + expf(-x)); }
 float mlr_gelu(float x) { return 0.5f * x * (1.0f + erff(x * 0.70710678118f)); }
 
-/* C = A (M x K) * B (K x N), all row major. */
-void mlr_matmul(const void *a, const void *b, void *c, int64_t M, int64_t N, int64_t K) {
-    const float *A = (const float *)a;
-    const float *B = (const float *)b;
-    float *C = (float *)c;
-    for (int64_t i = 0; i < M; i++) {
-        for (int64_t j = 0; j < N; j++) {
-            float sum = 0.0f;
-            for (int64_t k = 0; k < K; k++) {
-                sum += A[i * K + k] * B[k * N + j];
-            }
-            C[i * N + j] = sum;
+/* Optional parallelism. `MLR_THREADS=N` (N > 1) splits the row wise loops of
+ * the hottest kernels across N pthreads; the partition is by rows, so the
+ * result is the same for every thread count. The default is one thread. */
+#include <pthread.h>
+
+static int mlr_thread_count(void) {
+    static int n = 0;
+    if (n == 0) {
+        const char *t = getenv("MLR_THREADS");
+        n = (t != NULL && atoi(t) > 1) ? atoi(t) : 1;
+        if (n > 64) {
+            n = 64;
         }
     }
+    return n;
+}
+
+struct MlrRange {
+    int64_t begin;
+    int64_t end;
+    void (*fn)(int64_t begin, int64_t end, void *ctx);
+    void *ctx;
+};
+
+static void *mlr_range_worker(void *arg) {
+    struct MlrRange *r = (struct MlrRange *)arg;
+    r->fn(r->begin, r->end, r->ctx);
+    return NULL;
+}
+
+/* Runs fn(begin, end, ctx) over [0, total), split across the threads. */
+static void mlr_parallel_for(int64_t total, void (*fn)(int64_t, int64_t, void *), void *ctx) {
+    int n = mlr_thread_count();
+    if (n == 1 || total < 2 * n) {
+        fn(0, total, ctx);
+        return;
+    }
+    pthread_t threads[64];
+    struct MlrRange ranges[64];
+    int64_t chunk = (total + n - 1) / n;
+    int launched = 0;
+    for (int i = 0; i < n; i++) {
+        int64_t begin = i * chunk;
+        if (begin >= total) {
+            break;
+        }
+        int64_t end = begin + chunk;
+        if (end > total) {
+            end = total;
+        }
+        ranges[i].begin = begin;
+        ranges[i].end = end;
+        ranges[i].fn = fn;
+        ranges[i].ctx = ctx;
+        if (i > 0 && pthread_create(&threads[i], NULL, mlr_range_worker, &ranges[i]) == 0) {
+            launched++;
+        } else if (i > 0) {
+            /* A thread could not be created: the range runs inline. */
+            fn(begin, end, ctx);
+            ranges[i].end = begin; /* nothing left for the join below */
+        }
+    }
+    /* The first range belongs to the calling thread. */
+    fn(ranges[0].begin, ranges[0].end, ctx);
+    for (int i = 1; i < n; i++) {
+        if (ranges[i].begin < ranges[i].end && launched > 0) {
+            pthread_join(threads[i], NULL);
+        }
+    }
+}
+
+/* C = A (M x K) * B (K x N), all row major. */
+struct MlrMatmulCtx {
+    const float *A;
+    const float *B;
+    float *C;
+    int64_t N;
+    int64_t K;
+};
+
+static void mlr_matmul_rows(int64_t begin, int64_t end, void *arg) {
+    struct MlrMatmulCtx *m = (struct MlrMatmulCtx *)arg;
+    for (int64_t i = begin; i < end; i++) {
+        for (int64_t j = 0; j < m->N; j++) {
+            float sum = 0.0f;
+            for (int64_t k = 0; k < m->K; k++) {
+                sum += m->A[i * m->K + k] * m->B[k * m->N + j];
+            }
+            m->C[i * m->N + j] = sum;
+        }
+    }
+}
+
+void mlr_matmul(const void *a, const void *b, void *c, int64_t M, int64_t N, int64_t K) {
+    struct MlrMatmulCtx m = {(const float *)a, (const float *)b, (float *)c, N, K};
+    mlr_parallel_for(M, mlr_matmul_rows, &m);
 }
 
 /* A bias is added to every row of a matrix. */
@@ -1586,6 +1668,222 @@ void mlr_load_runtime(const char *path, const int64_t *dims, int64_t rank, void 
         exit(1);
     }
     fclose(f);
+}
+
+/* Reads a contiguous range of rows of the first dimension of a raw tensor
+ * file (the same format as `mlr_load_runtime`) into `out`. */
+void mlr_load_batch(const char *path, const int64_t *dims, int64_t rank, int64_t row, void *out,
+                    int64_t count) {
+    FILE *f = fopen(path, "rb");
+    if (!f) {
+        fprintf(stderr, "mlr: cannot open `%s`\n", path);
+        exit(1);
+    }
+    char magic[8];
+    if (fread(magic, 1, 8, f) != 8 || memcmp(magic, "MLRRWT01", 8) != 0) {
+        fprintf(stderr, "mlr: `%s` is not a raw tensor (the magic is missing)\n", path);
+        exit(1);
+    }
+    int64_t frank = 0;
+    if (fread(&frank, 8, 1, f) != 1 || frank != rank) {
+        fprintf(stderr, "mlr: `%s` has rank %lld, %lld was expected\n", path,
+                (long long)frank, (long long)rank);
+        exit(1);
+    }
+    int64_t per_row = 1;
+    int64_t file_rows = 0;
+    for (int64_t i = 0; i < rank; i++) {
+        int64_t d = 0;
+        if (fread(&d, 8, 1, f) != 1) {
+            fprintf(stderr, "mlr: `%s` is truncated\n", path);
+            exit(1);
+        }
+        if (i == 0) {
+            /* The first dimension is the extent of the file; the type only
+             * carries the size of the batch. */
+            file_rows = d;
+        } else {
+            per_row *= d;
+            if (d != dims[i]) {
+                fprintf(stderr,
+                        "mlr: `%s` has the dimension %lld at %lld, %lld was expected\n",
+                        path, (long long)d, (long long)i, (long long)dims[i]);
+                exit(1);
+            }
+        }
+    }
+    int64_t batch = count / (per_row > 0 ? per_row : 1);
+    if (row < 0 || row + batch > file_rows) {
+        fprintf(stderr, "mlr: `%s` has %lld rows, the rows %lld..%lld were expected\n",
+                path, (long long)file_rows, (long long)row, (long long)(row + batch));
+        exit(1);
+    }
+    if (fseek(f, (long)(row * per_row * 4), SEEK_CUR) != 0 ||
+        fread(out, 4, (size_t)count, f) != (size_t)count) {
+        fprintf(stderr, "mlr: `%s` is truncated\n", path);
+        exit(1);
+    }
+    fclose(f);
+}
+
+/* -------------------------------------------------------------------------
+ * The reductions along an axis, and the row wise operations.
+ * ------------------------------------------------------------------------- */
+
+/* Reduces one axis of a tensor: out[outer, inner] = f over axis_len values
+ * at in[outer, k, inner]. */
+void mlr_sum_axis(const void *x, void *out, int64_t outer, int64_t len, int64_t inner) {
+    const float *X = (const float *)x;
+    float *O = (float *)out;
+    for (int64_t o = 0; o < outer; o++) {
+        for (int64_t i = 0; i < inner; i++) {
+            float sum = 0.0f;
+            for (int64_t k = 0; k < len; k++) {
+                sum += X[((size_t)o * len + k) * inner + i];
+            }
+            O[o * inner + i] = sum;
+        }
+    }
+}
+
+void mlr_mean_axis(const void *x, void *out, int64_t outer, int64_t len, int64_t inner) {
+    mlr_sum_axis(x, out, outer, len, inner);
+    float *O = (float *)out;
+    for (int64_t i = 0; i < outer * inner; i++) {
+        O[i] /= (float)len;
+    }
+}
+
+void mlr_tmin_axis(const void *x, void *out, int64_t outer, int64_t len, int64_t inner) {
+    const float *X = (const float *)x;
+    float *O = (float *)out;
+    for (int64_t o = 0; o < outer; o++) {
+        for (int64_t i = 0; i < inner; i++) {
+            float best = X[((size_t)o * len) * inner + i];
+            for (int64_t k = 1; k < len; k++) {
+                float v = X[((size_t)o * len + k) * inner + i];
+                if (v < best) {
+                    best = v;
+                }
+            }
+            O[o * inner + i] = best;
+        }
+    }
+}
+
+void mlr_tmax_axis(const void *x, void *out, int64_t outer, int64_t len, int64_t inner) {
+    const float *X = (const float *)x;
+    float *O = (float *)out;
+    for (int64_t o = 0; o < outer; o++) {
+        for (int64_t i = 0; i < inner; i++) {
+            float best = X[((size_t)o * len) * inner + i];
+            for (int64_t k = 1; k < len; k++) {
+                float v = X[((size_t)o * len + k) * inner + i];
+                if (v > best) {
+                    best = v;
+                }
+            }
+            O[o * inner + i] = best;
+        }
+    }
+}
+
+void mlr_argmin_axis(const void *x, void *out, int64_t outer, int64_t len, int64_t inner) {
+    const float *X = (const float *)x;
+    int32_t *O = (int32_t *)out;
+    for (int64_t o = 0; o < outer; o++) {
+        for (int64_t i = 0; i < inner; i++) {
+            int32_t best = 0;
+            float bv = X[((size_t)o * len) * inner + i];
+            for (int64_t k = 1; k < len; k++) {
+                float v = X[((size_t)o * len + k) * inner + i];
+                if (v < bv) {
+                    bv = v;
+                    best = (int32_t)k;
+                }
+            }
+            O[o * inner + i] = best;
+        }
+    }
+}
+
+void mlr_argmax_axis(const void *x, void *out, int64_t outer, int64_t len, int64_t inner) {
+    const float *X = (const float *)x;
+    int32_t *O = (int32_t *)out;
+    for (int64_t o = 0; o < outer; o++) {
+        for (int64_t i = 0; i < inner; i++) {
+            int32_t best = 0;
+            float bv = X[((size_t)o * len) * inner + i];
+            for (int64_t k = 1; k < len; k++) {
+                float v = X[((size_t)o * len + k) * inner + i];
+                if (v > bv) {
+                    bv = v;
+                    best = (int32_t)k;
+                }
+            }
+            O[o * inner + i] = best;
+        }
+    }
+}
+
+/* Sorts every row (the last axis) ascending. An insertion sort keeps
+ * `mlr_argsort` stable. */
+void mlr_sort(const void *x, void *out, int64_t rows, int64_t n) {
+    const float *X = (const float *)x;
+    float *O = (float *)out;
+    for (int64_t r = 0; r < rows; r++) {
+        const float *src = X + (size_t)r * n;
+        float *dst = O + (size_t)r * n;
+        for (int64_t i = 0; i < n; i++) {
+            dst[i] = src[i];
+        }
+        for (int64_t i = 1; i < n; i++) {
+            float v = dst[i];
+            int64_t j = i - 1;
+            while (j >= 0 && dst[j] > v) {
+                dst[j + 1] = dst[j];
+                j--;
+            }
+            dst[j + 1] = v;
+        }
+    }
+}
+
+void mlr_argsort(const void *x, void *out, int64_t rows, int64_t n) {
+    const float *X = (const float *)x;
+    int32_t *O = (int32_t *)out;
+    for (int64_t r = 0; r < rows; r++) {
+        const float *src = X + (size_t)r * n;
+        int32_t *dst = O + (size_t)r * n;
+        for (int64_t i = 0; i < n; i++) {
+            dst[i] = (int32_t)i;
+        }
+        for (int64_t i = 1; i < n; i++) {
+            int32_t vi = dst[i];
+            float v = src[vi];
+            int64_t j = i - 1;
+            while (j >= 0 && src[dst[j]] > v) {
+                dst[j + 1] = dst[j];
+                j--;
+            }
+            dst[j + 1] = vi;
+        }
+    }
+}
+
+/* The inclusive prefix sum along the last axis. */
+void mlr_cumsum(const void *x, void *out, int64_t rows, int64_t n) {
+    const float *X = (const float *)x;
+    float *O = (float *)out;
+    for (int64_t r = 0; r < rows; r++) {
+        const float *src = X + (size_t)r * n;
+        float *dst = O + (size_t)r * n;
+        float sum = 0.0f;
+        for (int64_t i = 0; i < n; i++) {
+            sum += src[i];
+            dst[i] = sum;
+        }
+    }
 }
 
 int64_t mlr_now_ms(void) {

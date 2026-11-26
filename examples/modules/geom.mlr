@@ -1,0 +1,9 @@
+// A small module that the tests of the modules pull in.
+struct Vec2 {
+    x: f32,
+    y: f32
+}
+
+fn dot(a: Vec2, b: Vec2) -> f32 {
+    yield a.x * b.x + a.y * b.y
+}

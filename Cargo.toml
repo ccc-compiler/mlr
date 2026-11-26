@@ -1,6 +1,6 @@
 [package]
 name = "mlr"
-version = "0.2.0"
+version = "1.0.0"
 edition = "2021"
 description = "MLR: a high-level language whose semantics are isomorphic to MLIR's IR model"
 license = "MIT"

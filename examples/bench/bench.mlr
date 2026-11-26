@@ -1,0 +1,28 @@
+// A fixed amount of matrix multiplication, timed with the wall clock.
+// The first printed number is the elapsed time in milliseconds; the second
+// is a checksum of the results.
+
+fn step(a: Tensor<512x512xf32>, b: Tensor<512x512xf32>) -> f32 {
+    yield sum(matmul(a, b))
+}
+
+fn filled(v: f32) -> Tensor<512x512xf32> {
+    let t = tensor.zeros<Tensor<512x512xf32>>()
+    let out = for i in 0..512 step 1 iter(t = t) {
+        yield tensor.insert(t, [i, 0], v)
+    }
+    yield out
+}
+
+fn main() {
+    let t0 = now_ms()
+    let a = filled(0.001)
+    let b = filled(0.002)
+    let zero: f32 = 0.0
+    let total = for i in 0..10 step 1 iter(acc = zero) {
+        yield acc + step(a, b)
+    }
+    let t1 = now_ms()
+    print(t1 - t0)
+    print(total)
+}

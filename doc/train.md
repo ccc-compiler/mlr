@@ -188,14 +188,37 @@ stage 5  runtime calls
 | 元素級 `map` | **已實作（M3）** | 兩種模式：`map(t) \|v\| gelu(v)`（非線性，kernel 梯度）與線性 body（`v * c`、`v + c`、`c − v`、`v / c`——廣播運算的形狀，反向是同樣的線性映射） |
 | 函式呼叫 | **已實作（M3）** | 被微分函式裡對純前向函式的呼叫會被內聯（參數代換、值重編號），loss 可以拆成輔助函式 |
 
-### 4.4 控制流程限制（M1）
+### 4.4 控制流程（v1.2 起放寬）
 
-被微分的函式必須是**直線程式**：
+被微分的函式可以包含控制流，機制見 `src/passes/autodiff.rs`：
 
-* 允許：`let`、domain ops、元素級 `map`、`tensor.extract`（常數索引）。
-* 不允許：`for`、`if`（資料相關的控制流）、`reduce`、`tensor.insert`。
-  checker 在 `value_and_grad` 檢查時報錯——理由：靜態反向沒有分支的
-  累積語意；之後有需求再加（線性控制流 + 迴圈攜帶累積是標準做法）。
+* **`if`（資料相關分支）**：兩分支各自反向；對分支外值的貢獻是條件的，由
+  一個**新的** `scf.if`（同一條件、接在反向鏈之後）以額外的 result 回報，
+  兩分支對同一組外部值逐一相加。無值（void）的 `if` 不可微。
+* **`for`（累加器模式）**：攜帶值只能被**線性累加**——`yield acc + expr`
+  （也接受 `-` 與常數倍數），body 其餘部分不得讀取攜帶值。反向是一個同
+  範圍的迴圈：重放 body 中不依賴攜帶值的運算、以攜帶值的伴隨值為種子反向
+  走訪，對迴圈外值的貢獻放進額外的 iter args 累加。
+* **`tensor.extract`**：伴隨 = 把梯度以 `tensor.insert` 散射進零張量
+  （同索引讀兩次會相加）。
+* **`tensor.insert`**：伴隨 = 梯度去掉被寫入的位置（目標），寫入值拿走它。
+* **`map`**：與直線版相同——已知函式（`gelu`）或線性 body。
+
+仍不可微：巢狀控制流、`reduce`、`sample`/`argmax`（離散）、非 f32。
+典型場景——loss 內對資料做迴圈累加：
+
+```
+fn loss(w: Tensor<4xf32>, x: Tensor<4xf32>) -> f32 {
+    let zero: f32 = 0.0
+    let total = for i in 0..4 step 1 iter(acc = zero) {
+        yield acc + tensor.extract(w, [i]) * tensor.extract(x, [i])
+    }
+    yield total
+}
+```
+
+「攜帶權重、逐步更新權重」的訓練迴圈仍是**在程式層組合**（`value_and_grad`
+在迴圈內呼叫），不對整個迴圈微分。
 
 ### 4.5 記憶體
 

@@ -711,6 +711,7 @@ impl IrBuilder {
                     crate::check::SysKind::ExecF => "mlr.exec_f",
                     crate::check::SysKind::ExecTensor => "mlr.exec_tensor",
                     crate::check::SysKind::LoadRuntime => "mlr.load_runtime",
+                    crate::check::SysKind::LoadBatch => "mlr.load_batch",
                     crate::check::SysKind::Assert => "mlr.assert",
                 };
                 let mut o = Op::new(name);
@@ -987,13 +988,19 @@ impl IrBuilder {
             }
             "tensor.empty" | "tensor.zeros" => {
                 let ty = self.ty(&type_args[0]);
+                if name == "tensor.zeros" {
+                    // One op, no fill loops: the same op the autodiff uses
+                    // for the gradients of unused values.
+                    let mut o = Op::new("mlr.zeros");
+                    let res = self.fresh(ty);
+                    o.results.push(res.clone());
+                    self.emit(o);
+                    return res;
+                }
                 let mut o = Op::new("tensor.empty");
                 let res = self.fresh(ty.clone());
                 o.results.push(res.clone());
                 self.emit(o);
-                if name == "tensor.zeros" {
-                    return self.fill_zero(res, ty);
-                }
                 return res;
             }
             _ => {}
@@ -1034,105 +1041,6 @@ impl IrBuilder {
     }
 
     /// Fills a tensor with zeros using nested structured loops.
-    fn fill_zero(&mut self, tensor: Value, ty: Type) -> Value {
-        let (shape, elem) = match &ty {
-            Type::Tensor { shape, elem } => (shape.clone(), (**elem).clone()),
-            _ => return tensor,
-        };
-        let mut zero = Op::new("arith.constant");
-        // The zero has the element type of the tensor.
-        match &elem {
-            Type::Scalar(k) if k.is_int() => zero.attrs.push(("value".into(), Attr::Int(0))),
-            _ => zero.attrs.push(("value".into(), Attr::Float(0.0))),
-        }
-        let z = self.fresh(elem.clone());
-        zero.results.push(z.clone());
-        self.emit(zero);
-
-        let mut indices = Vec::new();
-        self.fill_zero_rec(&shape, 0, &mut indices, &tensor, &z, &ty)
-    }
-
-    /// One level of the zero filling: a loop per dimension, and an insert of
-    /// the zero at the full index in the innermost one.
-    fn fill_zero_rec(
-        &mut self,
-        shape: &[Dim],
-        level: usize,
-        indices: &mut Vec<Value>,
-        carried: &Value,
-        z: &Value,
-        ty: &Type,
-    ) -> Value {
-        if level == shape.len() {
-            let mut insert = Op::new("tensor.insert");
-            insert.operands.push(z.clone());
-            insert.operands.push(carried.clone());
-            insert.operands.extend(indices.iter().cloned());
-            let inserted = self.fresh(ty.clone());
-            insert.results.push(inserted.clone());
-            self.emit(insert);
-            return inserted;
-        }
-        let (lb, ub) = self.dim_bounds(&shape[level]);
-        let step = self.index_const(1);
-        let iv = self.fresh(Type::Index);
-        let arg = self.fresh(ty.clone());
-        let mut loop_op = Op::new("scf.for");
-        loop_op.operands.push(lb);
-        loop_op.operands.push(ub);
-        loop_op.operands.push(step);
-        loop_op.operands.push(carried.clone());
-        indices.push(iv.clone());
-        self.stack.push(Vec::new());
-        let inner = self.fill_zero_rec(shape, level + 1, indices, &arg, z, ty);
-        let mut ops = self.stack.pop().unwrap();
-        let mut yield_op = Op::new("scf.yield");
-        yield_op.operands.push(inner);
-        ops.push(yield_op);
-        loop_op.regions.push(Region {
-            blocks: vec![ir::Block {
-                args: vec![iv, arg],
-                ops,
-            }],
-        });
-        indices.pop();
-        let res = self.fresh(ty.clone());
-        loop_op.results.push(res.clone());
-        self.emit(loop_op);
-        res
-    }
-
-    fn index_const(&mut self, v: i64) -> Value {
-        let mut op = Op::new("arith.constant");
-        op.attrs.push(("value".into(), Attr::Int(v)));
-        let res = self.fresh(Type::Index);
-        op.results.push(res.clone());
-        self.emit(op);
-        res
-    }
-
-    fn dim_bounds(&mut self, dim: &Dim) -> (Value, Value) {
-        match dim {
-            Dim::Static(v) => {
-                let lb = self.index_const(0);
-                let ub = self.index_const(*v);
-                (lb, ub)
-            }
-            Dim::Dynamic => {
-                // A dynamic dimension is bounded by the runtime size; the
-                // bufferization stage replaces this with `memref.dim`.
-                let lb = self.index_const(0);
-                let mut op = Op::new("mlr.dim");
-                op.attrs.push(("dim".into(), Attr::Int(-1)));
-                let ub = self.fresh(Type::Index);
-                op.results.push(ub.clone());
-                self.emit(op);
-                (lb, ub)
-            }
-        }
-    }
-
     fn build_if(
         &mut self,
         cond: &TExpr,

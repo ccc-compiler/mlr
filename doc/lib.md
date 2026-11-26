@@ -41,7 +41,7 @@
 `mlr_assert(cond, msg)`（與 exec 的命令同機制）；`exec` 的子程序輸出重導
 到 stderr（`1>&2`），避免 SIGPIPE 且保持可見；`exec_i`/`exec_f` 讀取第一
 行、`strtol`/`strtod` 解析、drain 之後 `pclose`。
-| §10 之後 | cumsum sort argsort 資料載入器 檔案 IO | 記錄不做 |
+| §10 之後 | cumsum sort argsort 資料載入器 檔案 IO | cumsum/sort/argsort 已於 v1.5 實作；沿軸縮減（sum_axis 等）同；批次讀取 = `mlr.load_batch`；檔案 IO 仍記錄不做 |
 
 ---
 
@@ -230,6 +230,8 @@ runtime 不需要字串型別。
 ## 13. 之後
 
 * 字串型別（讀回 shell 輸出、路徑運算）。
-* 沿軸縮減、`cumsum`/`sort`。
-* 資料集迭代器（`dataset(path)` + 內建 shuffle/batch）。
+* ~~沿軸縮減、`cumsum`/`sort`~~（**v1.5 已實作**：`sum_axis`/`mean_axis`/
+  `tmin_axis`/`tmax_axis`/`argmin_axis`/`argmax_axis`、`sort`/`argsort`/
+  `cumsum`；批次讀取 = `mlr.load_batch`，shuffle 用現成的
+  `rand_permutation` + `gather`）。
 * 嵌入 Python 的反向方向：MLR 當 library 被 Python 呼叫（C API）。

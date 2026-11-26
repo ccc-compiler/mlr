@@ -1,0 +1,20 @@
+// A generic function: one definition, instantiated per shape constant.
+fn filled<N: i64>(v: f32) -> Tensor<Nxf32> {
+    let t = tensor.zeros<Tensor<Nxf32>>()
+    let out = for i in 0..N step 1 iter(t = t) {
+        yield tensor.insert(t, [i], v)
+    }
+    yield out
+}
+
+fn dot_sq<N: i64>(x: Tensor<Nxf32>, w: Tensor<Nxf32>) -> f32 {
+    yield sum(x * w)
+}
+
+fn main() {
+    let a = filled<4>(2.0)
+    let w = filled<4>(0.5)
+    print(tensor.extract(a, [3]))
+    print(dot_sq<4>(a, w))
+    print(sum(filled<3>(10.0)))
+}

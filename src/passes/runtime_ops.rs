@@ -301,6 +301,56 @@ const RUNTIME: &[RuntimeFn] = &[
         result: None,
     },
     RuntimeFn {
+        name: "mlr_load_batch",
+        params: &["index", "index", "index", "index", "index", "index"],
+        result: None,
+    },
+    RuntimeFn {
+        name: "mlr_sum_axis",
+        params: &["index", "index", "index", "index", "index"],
+        result: None,
+    },
+    RuntimeFn {
+        name: "mlr_mean_axis",
+        params: &["index", "index", "index", "index", "index"],
+        result: None,
+    },
+    RuntimeFn {
+        name: "mlr_tmin_axis",
+        params: &["index", "index", "index", "index", "index"],
+        result: None,
+    },
+    RuntimeFn {
+        name: "mlr_tmax_axis",
+        params: &["index", "index", "index", "index", "index"],
+        result: None,
+    },
+    RuntimeFn {
+        name: "mlr_argmin_axis",
+        params: &["index", "index", "index", "index", "index"],
+        result: None,
+    },
+    RuntimeFn {
+        name: "mlr_argmax_axis",
+        params: &["index", "index", "index", "index", "index"],
+        result: None,
+    },
+    RuntimeFn {
+        name: "mlr_sort",
+        params: &["index", "index", "index", "index"],
+        result: None,
+    },
+    RuntimeFn {
+        name: "mlr_argsort",
+        params: &["index", "index", "index", "index"],
+        result: None,
+    },
+    RuntimeFn {
+        name: "mlr_cumsum",
+        params: &["index", "index", "index", "index"],
+        result: None,
+    },
+    RuntimeFn {
         name: "mlr_exec_tensor",
         params: &["index", "index", "index", "index", "index"],
         result: None,
@@ -621,6 +671,21 @@ fn lower_ops(
             }
             "mlr.load_runtime" => {
                 lower_load_runtime(op, used, &mut out, globals, counter)
+            }
+            "mlr.load_batch" => {
+                lower_load_batch(op, used, &mut out, globals, counter)
+            }
+            "mlr.sum_axis" | "mlr.mean_axis" | "mlr.tmin_axis" | "mlr.tmax_axis" => {
+                lower_axis_reduce(op, used, &mut out)
+            }
+            "mlr.argmin_axis" | "mlr.argmax_axis" => {
+                lower_axis_arg(op, used, &mut out)
+            }
+            "mlr.sort" | "mlr.cumsum" => {
+                lower_rowwise(op, used, &mut out, false)
+            }
+            "mlr.argsort" => {
+                lower_rowwise(op, used, &mut out, true)
             }
             "mlr.assert" => lower_assert(op, used, &mut out, globals, counter),
             "mlr.print_str" => lower_print_str(op, used, &mut out, globals, counter),
@@ -1421,12 +1486,20 @@ fn lower_zeros(op: Op, used: &mut Vec<&'static str>, out: &mut Vec<Op>) {
     out.push(call);
 }
 
-/// The element wise sum of two tensors.
+/// The element wise sum of two tensors. Two scalars are summed with
+/// `arith.addf`: they are SSA values, not buffers.
 fn lower_add_elem(op: Op, used: &mut Vec<&'static str>, out: &mut Vec<Op>) {
-    used.push("mlr_add_elem");
     let a = op.operands[0].clone();
     let b = op.operands[1].clone();
     let result = op.results[0].clone();
+    if !matches!(result.ty, Type::MemRef { .. } | Type::Tensor { .. }) {
+        let mut sum = Op::new("arith.addf");
+        sum.operands = vec![a, b];
+        sum.results.push(result);
+        out.push(sum);
+        return;
+    }
+    used.push("mlr_add_elem");
     let n = count(&result.ty);
     let mut l = Lowerer { b: Builder::new() };
     let out_ty = match &result.ty {
@@ -3139,6 +3212,253 @@ fn lower_load_runtime(
         .attrs
         .push(("callee".into(), Attr::Str("mlr_load_runtime".into())));
     call.operands = vec![pp, pdims_v, crank_v, pout_v, ccount_v];
+    out.push(call);
+}
+
+/// `mlr.load_batch<T>(path, row)`: the same raw tensor format as
+/// `mlr.load_runtime`, but only a contiguous range of rows of the first
+/// dimension is read.
+fn lower_load_batch(
+    op: Op,
+    used: &mut Vec<&'static str>,
+    out: &mut Vec<Op>,
+    globals: &mut Vec<crate::ir::Global>,
+    counter: &mut usize,
+) {
+    used.push("mlr_load_batch");
+    let path = match op.attr("cmd") {
+        Some(Attr::Str(s)) => s.clone(),
+        _ => String::new(),
+    };
+    let result = op.results[0].clone();
+    let count = count(&result.ty);
+    let dims = dims(&result.ty);
+    let rank = dims.len() as i64;
+    let row = op.operands[0].clone();
+    let mut l = Lowerer { b: Builder::new() };
+    let pp = l.string_ptr(globals, counter, &path, out);
+    let dims_name = format!("__mlr_dims{}", *counter);
+    *counter += 1;
+    let dims_ty = Type::MemRef {
+        shape: vec![Dim::Static(rank)],
+        elem: Box::new(Type::Scalar(crate::ir::ScalarKind::I64)),
+    };
+    globals.push(crate::ir::Global {
+        name: dims_name.clone(),
+        ty: dims_ty.clone(),
+        value: Attr::DenseI64(dims),
+    });
+    let mut get = Op::new("memref.get_global");
+    get.attrs.push(("name".into(), Attr::Str(dims_name)));
+    let g = l.b.fresh_value(dims_ty.clone());
+    get.results.push(g.clone());
+    out.push(get);
+    let pdims = l.pointer(&g);
+    let pdims_v = pdims.results[0].clone();
+    out.push(pdims);
+    let out_ty = match &result.ty {
+        Type::MemRef { .. } => result.ty.clone(),
+        t => t.clone(),
+    };
+    let alloc = l.alloc(out_ty, &result);
+    out.push(alloc);
+    let pout = l.pointer(&result);
+    let pout_v = pout.results[0].clone();
+    out.push(pout);
+    let ccount = l.const_index(count);
+    let ccount_v = ccount.results[0].clone();
+    out.push(ccount);
+    let crank = l.const_index(rank);
+    let crank_v = crank.results[0].clone();
+    out.push(crank);
+    // The first row: i32 -> index.
+    let mut cast = Op::new("arith.index_cast");
+    cast.operands.push(row);
+    let crow = l.b.fresh_value(Type::Index);
+    cast.results.push(crow.clone());
+    out.push(cast);
+    let mut call = Op::new("func.call");
+    call
+        .attrs
+        .push(("callee".into(), Attr::Str("mlr_load_batch".into())));
+    call.operands = vec![pp, pdims_v, crank_v, crow, pout_v, ccount_v];
+    out.push(call);
+}
+
+/// The reductions along one axis: `sum_axis`, `mean_axis`, `tmin_axis`,
+/// `tmax_axis`. The axis is a parameter of the operation.
+fn lower_axis_reduce(op: Op, used: &mut Vec<&'static str>, out: &mut Vec<Op>) {
+    let name = match op.name.as_str() {
+        "mlr.sum_axis" => {
+            used.push("mlr_sum_axis");
+            "mlr_sum_axis"
+        }
+        "mlr.mean_axis" => {
+            used.push("mlr_mean_axis");
+            "mlr_mean_axis"
+        }
+        "mlr.tmin_axis" => {
+            used.push("mlr_tmin_axis");
+            "mlr_tmin_axis"
+        }
+        _ => {
+            used.push("mlr_tmax_axis");
+            "mlr_tmax_axis"
+        }
+    };
+    let x = op.operands[0].clone();
+    let result = op.results[0].clone();
+    let d = dims(&x.ty);
+    let axis = match op.attr("p0") {
+        Some(Attr::Int(v)) => *v,
+        _ => 0,
+    };
+    let mut outer = 1i64;
+    let mut inner = 1i64;
+    for (i, v) in d.iter().enumerate() {
+        if (i as i64) < axis {
+            outer *= v;
+        } else if (i as i64) > axis {
+            inner *= v;
+        }
+    }
+    let axis_len = d.get(axis as usize).copied().unwrap_or(1);
+    let mut l = Lowerer { b: Builder::new() };
+    let out_ty = match &result.ty {
+        Type::MemRef { .. } => result.ty.clone(),
+        t => t.clone(),
+    };
+    out.push(l.alloc(out_ty, &result));
+    let px = l.pointer(&x);
+    let pout = l.pointer(&result);
+    let co = l.const_index(outer);
+    let cl = l.const_index(axis_len);
+    let ci = l.const_index(inner);
+    out.push(px.clone());
+    out.push(pout.clone());
+    out.push(co.clone());
+    out.push(cl.clone());
+    out.push(ci.clone());
+    let mut call = Op::new("func.call");
+    call
+        .attrs
+        .push(("callee".into(), Attr::Str(name.into())));
+    call.operands = vec![
+        px.results[0].clone(),
+        pout.results[0].clone(),
+        co.results[0].clone(),
+        cl.results[0].clone(),
+        ci.results[0].clone(),
+    ];
+    out.push(call);
+}
+
+/// The argmin/argmax along one axis; the result holds i32 indices.
+fn lower_axis_arg(op: Op, used: &mut Vec<&'static str>, out: &mut Vec<Op>) {
+    let is_max = op.name == "mlr.argmax_axis";
+    if is_max {
+        used.push("mlr_argmax_axis");
+    } else {
+        used.push("mlr_argmin_axis");
+    }
+    let x = op.operands[0].clone();
+    let result = op.results[0].clone();
+    let d = dims(&x.ty);
+    let axis = match op.attr("p0") {
+        Some(Attr::Int(v)) => *v,
+        _ => 0,
+    };
+    let mut outer = 1i64;
+    let mut inner = 1i64;
+    for (i, v) in d.iter().enumerate() {
+        if (i as i64) < axis {
+            outer *= v;
+        } else if (i as i64) > axis {
+            inner *= v;
+        }
+    }
+    let axis_len = d.get(axis as usize).copied().unwrap_or(1);
+    let mut l = Lowerer { b: Builder::new() };
+    let out_ty = match &result.ty {
+        Type::MemRef { .. } => result.ty.clone(),
+        t => t.clone(),
+    };
+    out.push(l.alloc(out_ty, &result));
+    let px = l.pointer(&x);
+    let pout = l.pointer(&result);
+    let co = l.const_index(outer);
+    let cl = l.const_index(axis_len);
+    let ci = l.const_index(inner);
+    out.push(px.clone());
+    out.push(pout.clone());
+    out.push(co.clone());
+    out.push(cl.clone());
+    out.push(ci.clone());
+    let mut call = Op::new("func.call");
+    call
+        .attrs
+        .push(("callee".into(), Attr::Str(if is_max {
+            "mlr_argmax_axis"
+        } else {
+            "mlr_argmin_axis"
+        }
+        .into())));
+    call.operands = vec![
+        px.results[0].clone(),
+        pout.results[0].clone(),
+        co.results[0].clone(),
+        cl.results[0].clone(),
+        ci.results[0].clone(),
+    ];
+    out.push(call);
+}
+
+/// `sort`, `argsort` and `cumsum`: element wise along the last axis, one
+/// independent row at a time (insertion sort, so `argsort` is stable).
+fn lower_rowwise(op: Op, used: &mut Vec<&'static str>, out: &mut Vec<Op>, indices: bool) {
+    if indices {
+        used.push("mlr_argsort");
+    } else if op.name == "mlr.sort" {
+        used.push("mlr_sort");
+    } else {
+        used.push("mlr_cumsum");
+    }
+    let x = op.operands[0].clone();
+    let result = op.results[0].clone();
+    let d = dims(&x.ty);
+    let rows = d[..d.len() - 1].iter().product::<i64>().max(1);
+    let rowlen = d[d.len() - 1];
+    let mut l = Lowerer { b: Builder::new() };
+    let out_ty = match &result.ty {
+        Type::MemRef { .. } => result.ty.clone(),
+        t => t.clone(),
+    };
+    out.push(l.alloc(out_ty, &result));
+    let px = l.pointer(&x);
+    let pout = l.pointer(&result);
+    let cr = l.const_index(rows);
+    let cn = l.const_index(rowlen);
+    out.push(px.clone());
+    out.push(pout.clone());
+    out.push(cr.clone());
+    out.push(cn.clone());
+    let name = if indices {
+        "mlr_argsort"
+    } else if op.name == "mlr.sort" {
+        "mlr_sort"
+    } else {
+        "mlr_cumsum"
+    };
+    let mut call = Op::new("func.call");
+    call
+        .attrs
+        .push(("callee".into(), Attr::Str(name.into())));
+    call.operands = vec![
+        px.results[0].clone(),
+        pout.results[0].clone(),
+        cr.results[0].clone(),
+        cn.results[0].clone(),
+    ];
     out.push(call);
 }
 

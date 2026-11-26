@@ -7,8 +7,9 @@ MLR is a zero-dependency Rust compiler for a high-level language that emits MLIR
 ## Commands
 
 - Build: `cargo build --release` (no external crates; `Cargo.toml` has an empty `[dependencies]` by design — don't add crates casually).
+- CI: `.github/workflows/ci.yml` (Linux CPU + macOS MPS; runs `cargo test --release` with `MLR_REQUIRE_E2E=1`, plus `scripts/run_all.sh` on macOS).
 - Tests: `cargo test` (or `scripts/test.sh`). Integration tests in `tests/compile.rs` drive the `mlr` binary via `CARGO_BIN_EXE_mlr`; `tests/ir.rs` builds bad IR modules directly against the lib target to test the verifier.
-- Run an example end-to-end: `scripts/run.sh examples/scalar.mlr` (or `scripts/run_mps.sh` for the Metal/GPU runtime). These need `mlir-opt`, `mlir-translate`, and `clang` — on macOS via Homebrew llvm (`/opt/homebrew/opt/llvm/bin`). If those tools are missing, e2e tests in `tests/compile.rs` **silently skip** (they return `None` instead of failing) — a green test run does not prove the end-to-end path works.
+- Run an example end-to-end: `scripts/run.sh examples/scalar.mlr` (or `scripts/run_mps.sh` for the Metal/GPU runtime). These need `mlir-opt`, `mlir-translate`, and `clang` — on macOS via Homebrew llvm (`/opt/homebrew/opt/llvm/bin`). E2e tests **skip when the tool chain is missing, but any actual run failure fails the test** (a run that fails while the tools are present panics); set `MLR_REQUIRE_E2E=1` to make a missing tool chain a hard failure (CI does). The MPS GPU test only runs on macOS.
 
 ## Gotchas
 

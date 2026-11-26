@@ -158,6 +158,15 @@ pub enum DomainOp {
     Flatten,
     Row,
     ArgMax,
+    SumAxis,
+    MeanAxis,
+    TminAxis,
+    TmaxAxis,
+    ArgMinAxis,
+    ArgMaxAxis,
+    Sort,
+    ArgSort,
+    Cumsum,
     AddBias,
     Embed,
     EmbedSeq,
@@ -208,6 +217,15 @@ impl DomainOp {
             DomainOp::Flatten => "flatten",
             DomainOp::Row => "row",
             DomainOp::ArgMax => "argmax",
+            DomainOp::SumAxis => "sum_axis",
+            DomainOp::MeanAxis => "mean_axis",
+            DomainOp::TminAxis => "tmin_axis",
+            DomainOp::TmaxAxis => "tmax_axis",
+            DomainOp::ArgMinAxis => "argmin_axis",
+            DomainOp::ArgMaxAxis => "argmax_axis",
+            DomainOp::Sort => "sort",
+            DomainOp::ArgSort => "argsort",
+            DomainOp::Cumsum => "cumsum",
             DomainOp::AddBias => "add_bias",
             DomainOp::Embed => "embed",
             DomainOp::EmbedSeq => "embed_seq",
@@ -388,6 +406,7 @@ pub enum SysKind {
     ExecF,
     ExecTensor,
     LoadRuntime,
+    LoadBatch,
     Assert,
 }
 
@@ -464,6 +483,15 @@ pub struct Checker {
     struct_ids: HashMap<String, usize>,
     /// The first error that a place without a `Result` has seen.
     error: Option<Error>,
+    /// The errors of the functions that failed to check; reported together by
+    /// `check_all`.
+    errors: Vec<Error>,
+    /// The generic functions (`fn f<N: i64>(...)`), keyed by name. They are
+    /// not checked directly; every instantiation is checked on its own.
+    templates: HashMap<String, Func>,
+    /// The checked instantiations of the templates, in the order they were
+    /// first called.
+    instantiated: Vec<TFunc>,
 }
 
 fn err<T>(msg: impl Into<String>, span: &Span) -> Result<T, Error> {
@@ -510,18 +538,34 @@ impl Checker {
             structs: Vec::new(),
             struct_ids: HashMap::new(),
             error: None,
+            errors: Vec::new(),
+            templates: HashMap::new(),
+            instantiated: Vec::new(),
         }
     }
 
-    pub fn check(mut self, prog: &Program) -> Result<TProgram, Error> {
+    /// Reports only the first error, in source order (the historical API).
+    /// The driver uses `check_all`; this remains for the lib tests.
+    #[allow(dead_code)]
+    pub fn check(self, prog: &Program) -> Result<TProgram, Error> {
+        self.check_all(prog).map_err(|mut errs| {
+            errs.sort_by(|a, b| (a.span.line, a.span.col).cmp(&(b.span.line, b.span.col)));
+            errs.remove(0)
+        })
+    }
+
+    /// Reports every error that the checker can reach: the structural checks
+    /// stop at the first problem, but each function/method is checked
+    /// independently so their errors are all collected.
+    pub fn check_all(mut self, prog: &Program) -> Result<TProgram, Vec<Error>> {
         // The names of the structs come first, so that the types of their
         // fields (and of the parameters of the functions) can name them.
         for s in &prog.structs {
             if self.struct_ids.contains_key(&s.name) {
-                return err(
-                    format!("duplicate definition of struct `{}`", s.name),
-                    &s.span,
-                );
+                return Err(vec![Error {
+                    msg: format!("duplicate definition of struct `{}`", s.name),
+                    span: s.span.clone(),
+                }]);
             }
             self.struct_ids
                 .insert(s.name.clone(), self.structs.len());
@@ -538,10 +582,10 @@ impl Checker {
             for (fname, fty) in &s.fields {
                 let ty = self.resolve(fty, &s.span);
                 if matches!(ty, CType::Void) {
-                    return err(
-                        format!("the field `{}.{}` has no type", s.name, fname),
-                        &s.span,
-                    );
+                    return Err(vec![Error {
+                        msg: format!("the field `{}.{}` has no type", s.name, fname),
+                        span: s.span.clone(),
+                    }]);
                 }
                 fields.push((fname.clone(), ty));
             }
@@ -550,18 +594,24 @@ impl Checker {
         // A struct may not contain itself, directly or indirectly.
         for (id, s) in prog.structs.iter().enumerate() {
             if self.reaches(id, id) {
-                return err(
-                    format!("the struct `{}` contains itself", s.name),
-                    &s.span,
-                );
+                return Err(vec![Error {
+                    msg: format!("the struct `{}` contains itself", s.name),
+                    span: s.span.clone(),
+                }]);
             }
         }
         for f in &prog.funcs {
-            if self.sigs.contains_key(&f.name) {
-                return err(
-                    format!("duplicate definition of function `{}`", f.name),
-                    &f.span,
-                );
+            if self.sigs.contains_key(&f.name) || self.templates.contains_key(&f.name) {
+                return Err(vec![Error {
+                    msg: format!("duplicate definition of function `{}`", f.name),
+                    span: f.span.clone(),
+                }]);
+            }
+            if !f.type_params.is_empty() {
+                // A generic function: kept as a template, checked once per
+                // instantiation.
+                self.templates.insert(f.name.clone(), f.clone());
+                continue;
             }
             self.sigs.insert(
                 f.name.clone(),
@@ -574,18 +624,18 @@ impl Checker {
         // The methods are functions with the name of their struct in front.
         for block in &prog.impls {
             if !self.struct_ids.contains_key(&block.name) {
-                return err(
-                    format!("`impl` of the unknown struct `{}`", block.name),
-                    &block.span,
-                );
+                return Err(vec![Error {
+                    msg: format!("`impl` of the unknown struct `{}`", block.name),
+                    span: block.span.clone(),
+                }]);
             }
             for m in &block.methods {
                 let full = format!("{}.{}", block.name, m.name);
                 if self.sigs.contains_key(&full) {
-                    return err(
-                        format!("duplicate definition of method `{}`", full),
-                        &m.span,
-                    );
+                    return Err(vec![Error {
+                        msg: format!("duplicate definition of method `{}`", full),
+                        span: m.span.clone(),
+                    }]);
                 }
                 self.sigs.insert(
                     full,
@@ -599,6 +649,9 @@ impl Checker {
         // Signatures need the parameter types, which requires resolving the
         // symbolic dimensions of the parameters first.
         for f in &prog.funcs {
+            if !f.type_params.is_empty() {
+                continue;
+            }
             let params: Vec<CType> = f
                 .params
                 .iter()
@@ -621,7 +674,16 @@ impl Checker {
         }
         let mut out = Vec::new();
         for f in &prog.funcs {
-            out.push(self.check_func(f)?);
+            if !f.type_params.is_empty() {
+                // A generic function is only checked when it is called.
+                continue;
+            }
+            // One broken function does not stop the others from being checked:
+            // their errors are collected and reported together.
+            match self.check_func(f) {
+                Ok(f) => out.push(f),
+                Err(e) => self.errors.push(e),
+            }
         }
         for block in &prog.impls {
             for m in &block.methods {
@@ -629,12 +691,19 @@ impl Checker {
                 // front, which is how it is called.
                 let mut method = m.clone();
                 method.name = format!("{}.{}", block.name, m.name);
-                out.push(self.check_func(&method)?);
+                match self.check_func(&method) {
+                    Ok(f) => out.push(f),
+                    Err(e) => self.errors.push(e),
+                }
             }
         }
         if let Some(e) = self.error {
-            return Err(e);
+            self.errors.push(e);
         }
+        if !self.errors.is_empty() {
+            return Err(self.errors);
+        }
+        out.extend(self.instantiated);
         Ok(TProgram {
             structs: self.structs.clone(),
             funcs: out,
@@ -674,6 +743,18 @@ impl Checker {
                     .map(|d| match d {
                         SrcDim::Static(v) => CDim::Static(*v),
                         SrcDim::Dynamic => CDim::Dynamic,
+                        SrcDim::Named(n) => {
+                            // A named dimension only exists inside a generic
+                            // function, where the instantiation has already
+                            // replaced it with a constant.
+                            if self.error.is_none() {
+                                self.error = Some(Error {
+                                    msg: format!("unknown dimension `{}`", n),
+                                    span: span.clone(),
+                                });
+                            }
+                            CDim::Dynamic
+                        }
                     })
                     .collect();
                 let elem = self.resolve(elem, span);
@@ -681,6 +762,15 @@ impl Checker {
                     dims,
                     elem: Box::new(elem),
                 }
+            }
+            SrcType::Const(_) => {
+                if self.error.is_none() {
+                    self.error = Some(Error {
+                        msg: "a shape constant is not a type".to_string(),
+                        span: span.clone(),
+                    });
+                }
+                CType::Void
             }
             SrcType::Named(name) => match self.struct_ids.get(name) {
                 Some(id) => CType::Struct(*id),
@@ -1920,6 +2010,15 @@ impl Checker {
             "dropout" => DomainOp::Dropout,
             "accuracy" => DomainOp::Accuracy,
             "sample" => DomainOp::Sample,
+            "sum_axis" => DomainOp::SumAxis,
+            "mean_axis" => DomainOp::MeanAxis,
+            "tmin_axis" => DomainOp::TminAxis,
+            "tmax_axis" => DomainOp::TmaxAxis,
+            "argmin_axis" => DomainOp::ArgMinAxis,
+            "argmax_axis" => DomainOp::ArgMaxAxis,
+            "sort" => DomainOp::Sort,
+            "argsort" => DomainOp::ArgSort,
+            "cumsum" => DomainOp::Cumsum,
             _ => unreachable!(),
         };
         let mut targs = Vec::new();
@@ -2629,6 +2728,72 @@ impl Checker {
                 }
                 (CType::Scalar(ScalarKind::I32), vec![])
             }
+            DomainOp::SumAxis | DomainOp::MeanAxis | DomainOp::TminAxis | DomainOp::TmaxAxis
+            | DomainOp::ArgMinAxis | DomainOp::ArgMaxAxis => {
+                if targs.len() != 2 {
+                    return err(format!("`{}` takes a tensor and the axis", name), span);
+                }
+                let (d, _) = tensor(&targs[0].ty())?;
+                let axis = match &targs[1] {
+                    TExpr::ConstInt(v, _) => *v,
+                    _ => return err(format!("the axis of `{}` must be a constant", name), span),
+                };
+                if axis < 0 || axis as usize >= d.len() {
+                    return err(
+                        format!(
+                            "the axis of `{}` is {} but the tensor has rank {}",
+                            name,
+                            axis,
+                            d.len()
+                        ),
+                        span,
+                    );
+                }
+                let mut out = Vec::new();
+                for (i, v) in d.iter().enumerate() {
+                    if i != axis as usize {
+                        out.push(CDim::Static(*v));
+                    }
+                }
+                let elem = match op {
+                    DomainOp::ArgMinAxis | DomainOp::ArgMaxAxis => CType::Scalar(ScalarKind::I32),
+                    _ => CType::Scalar(ScalarKind::F32),
+                };
+                // The axis travels to the runtime as a parameter.
+                (CType::Tensor { dims: out, elem: Box::new(elem) }, vec![axis])
+            }
+            DomainOp::Sort | DomainOp::Cumsum => {
+                if targs.len() != 1 {
+                    return err(format!("`{}` takes one tensor", name), span);
+                }
+                let (d, e) = tensor(&targs[0].ty())?;
+                if d.is_empty() {
+                    return err(format!("`{}` expects a tensor of rank 1 or more", name), span);
+                }
+                (
+                    CType::Tensor {
+                        dims: d.iter().map(|v| CDim::Static(*v)).collect(),
+                        elem: Box::new(e),
+                    },
+                    vec![],
+                )
+            }
+            DomainOp::ArgSort => {
+                if targs.len() != 1 {
+                    return err("`argsort` takes one tensor", span);
+                }
+                let (d, _) = tensor(&targs[0].ty())?;
+                if d.is_empty() {
+                    return err("`argsort` expects a tensor of rank 1 or more", span);
+                }
+                (
+                    CType::Tensor {
+                        dims: d.iter().map(|v| CDim::Static(*v)).collect(),
+                        elem: Box::new(CType::Scalar(ScalarKind::I32)),
+                    },
+                    vec![],
+                )
+            }
             DomainOp::Embed => {
                 // embed(w: Tensor<VxWxf32>, id: i32) -> Tensor<Wxf32>
                 if targs.len() != 2 {
@@ -3152,6 +3317,77 @@ impl Checker {
                     ty,
                 });
             }
+            "mlr.load_batch" => {
+                // Reads a contiguous range of rows of the first dimension of
+                // a raw tensor file at run time: `mlr.load_batch<T>(path,
+                // row)`, where the first dimension of T is the batch size.
+                if type_args.len() != 1 {
+                    return err("`mlr.load_batch` takes exactly one type argument", span);
+                }
+                if args.len() != 2 {
+                    return err("`mlr.load_batch` takes the path and the first row", span);
+                }
+                let path = match &args[0] {
+                    Expr::Str(text, _) => text.clone(),
+                    _ => {
+                        return err(
+                            "`mlr.load_batch` expects the path as a string literal",
+                            span,
+                        )
+                    }
+                };
+                let ty = self.resolve(&type_args[0], span);
+                match ty.dims() {
+                    Some(dims) => {
+                        if dims.is_empty() {
+                            return err("`mlr.load_batch` expects a tensor of rank 1 or more", span);
+                        }
+                        for dim in dims {
+                            if matches!(dim, CDim::Dynamic) {
+                                return err(
+                                    "`mlr.load_batch` needs a type with static dimensions",
+                                    span,
+                                );
+                            }
+                        }
+                    }
+                    None => {
+                        return err(
+                            format!("`mlr.load_batch` expects a tensor type, found {}", ty.print()),
+                            span,
+                        )
+                    }
+                }
+                match ty.elem() {
+                    Some(CType::Scalar(ScalarKind::F32))
+                    | Some(CType::Scalar(ScalarKind::I32)) => {}
+                    _ => {
+                        return err(
+                            format!(
+                                "`mlr.load_batch` expects f32 or i32 elements, found {}",
+                                ty.print()
+                            ),
+                            span,
+                        )
+                    }
+                }
+                let row = self.check_expr(&args[1])?;
+                let row = match row.ty() {
+                    CType::Scalar(ScalarKind::I32) => row,
+                    t => {
+                        return err(
+                            format!("the first row of `mlr.load_batch` must be i32, found {}", t.print()),
+                            span,
+                        )
+                    }
+                };
+                return Ok(TExpr::Sys {
+                    kind: SysKind::LoadBatch,
+                    cmd: path,
+                    args: vec![row],
+                    ty,
+                });
+            }
             "exec_tensor" => {
                 if type_args.len() != 1 {
                     return err("`exec_tensor` takes exactly one type argument", span);
@@ -3519,6 +3755,8 @@ impl Checker {
             | "concat" | "rows" | "reverse" | "iota" | "linspace" | "onehot"
             | "rand_permutation" | "gather"
             | "dropout" | "accuracy"
+            | "sum_axis" | "mean_axis" | "tmin_axis" | "tmax_axis" | "argmin_axis"
+            | "argmax_axis" | "sort" | "argsort" | "cumsum"
                 if !self.sigs.contains_key(name) =>
             {
                 // A function of the program shadows the builtin.
@@ -3633,8 +3871,28 @@ impl Checker {
             }
             _ => {}
         }
-        // User functions.
-        let sig = match self.sigs.get(name) {
+        // User functions. A generic function is instantiated for the shape
+        // constants of the call: `f<4>(x)` checks (and monomorphizes) `f`
+        // with N = 4 under the mangled name `f@4`.
+        let name = if self.sigs.contains_key(name) {
+            name.to_string()
+        } else if let Some(template) = self.templates.get(name).cloned() {
+            self.instantiate(&template, type_args, span)?
+        } else {
+            return err(
+                if self.templates.contains_key(name) {
+                    format!(
+                        "the function `{}` is generic; call it with its shape \
+                         arguments: `{}<n>(...)`",
+                        name, name
+                    )
+                } else {
+                    format!("unknown function `{}`", name)
+                },
+                span,
+            );
+        };
+        let sig = match self.sigs.get(&name) {
             Some(s) => s.clone(),
             None => return err(format!("unknown function `{}`", name), span),
         };
@@ -3670,10 +3928,263 @@ impl Checker {
             ret: sig.ret.unwrap_or(CType::Void),
         })
     }
+
+    /// Checks one instantiation of a generic function: the shape constants
+    /// of the call are bound to the type parameters, the function is copied
+    /// with the constants substituted, and it is checked under its mangled
+    /// name. Repeated calls with the same constants reuse the instance.
+    fn instantiate(
+        &mut self,
+        template: &Func,
+        type_args: &[SrcType],
+        span: &Span,
+    ) -> Result<String, Error> {
+        if type_args.len() != template.type_params.len() {
+            return err(
+                format!(
+                    "the function `{}` takes {} shape argument(s), found {}",
+                    template.name,
+                    template.type_params.len(),
+                    type_args.len()
+                ),
+                span,
+            );
+        }
+        let mut binding: HashMap<String, i64> = HashMap::new();
+        for ((pname, _), ta) in template.type_params.iter().zip(type_args.iter()) {
+            let v = match ta {
+                SrcType::Const(v) => *v,
+                _ => {
+                    return err(
+                        format!(
+                            "the shape argument of `{}` must be a constant",
+                            template.name
+                        ),
+                        span,
+                    )
+                }
+            };
+            binding.insert(pname.clone(), v);
+        }
+        let consts: Vec<String> = template
+            .type_params
+            .iter()
+            .map(|(p, _)| format!("{}.{}", p, binding[p]))
+            .collect();
+        let mangled = format!("{}.{}", template.name, consts.join("."));
+        if self.sigs.contains_key(&mangled) {
+            return Ok(mangled);
+        }
+        let mut instance = subst_func(template, &binding);
+        instance.name = mangled.clone();
+        // The signature is registered first, so that a recursive call inside
+        // the body finds it.
+        let params: Vec<CType> = instance
+            .params
+            .iter()
+            .map(|p| self.resolve(&p.ty, &p.span))
+            .collect();
+        let ret = instance.ret.as_ref().map(|r| self.resolve(r, &instance.span));
+        self.sigs.insert(
+            mangled.clone(),
+            Sig {
+                params,
+                ret: ret.clone(),
+            },
+        );
+        // `check_func` resets the scopes and the return type; the caller is
+        // in the middle of its own body, so both are saved and restored.
+        let saved_scopes = std::mem::take(&mut self.scopes);
+        let saved_ret = self.cur_ret.take();
+        match self.check_func(&instance) {
+            Ok(f) => self.instantiated.push(f),
+            Err(e) => self.errors.push(e),
+        }
+        self.scopes = saved_scopes;
+        self.cur_ret = saved_ret;
+        Ok(mangled)
+    }
 }
 
+/// Copies a generic function with the shape constants of one instantiation
+/// substituted for its type parameters: the dimensions of every type, and
+/// the shape arguments of the calls in the body (`f<N>` becomes `f<4>`,
+/// which resolves to the instance `f@4`).
+fn subst_func(f: &Func, binding: &HashMap<String, i64>) -> Func {
+    let mut out = f.clone();
+    for p in &mut out.params {
+        p.ty = subst_type(&p.ty, binding);
+    }
+    out.ret = out.ret.as_ref().map(|r| subst_type(r, binding));
+    subst_block(&mut out.body, binding);
+    out
+}
+
+fn subst_type(ty: &SrcType, binding: &HashMap<String, i64>) -> SrcType {
+    match ty {
+        SrcType::Tensor { dims, elem } => SrcType::Tensor {
+            dims: dims
+                .iter()
+                .map(|d| match d {
+                    SrcDim::Named(n) => match binding.get(n) {
+                        Some(v) => SrcDim::Static(*v),
+                        None => SrcDim::Named(n.clone()),
+                    },
+                    other => other.clone(),
+                })
+                .collect(),
+            elem: Box::new(subst_type(elem, binding)),
+        },
+        // In the shape arguments of a call, a type parameter stands for the
+        // constant of this instantiation.
+        SrcType::Named(n) => match binding.get(n) {
+            Some(v) => SrcType::Const(*v),
+            None => SrcType::Named(n.clone()),
+        },
+        other => other.clone(),
+    }
+}
+
+fn subst_block(block: &mut Block, binding: &HashMap<String, i64>) {
+    for stmt in &mut block.stmts {
+        match stmt {
+            Stmt::Let { ty, value, .. } => {
+                if let Some(t) = ty {
+                    *t = subst_type(t, binding);
+                }
+                subst_expr(value, binding);
+            }
+            Stmt::LetMulti(m) => {
+                subst_expr(&mut m.value, binding);
+            }
+            Stmt::Effect(e) => subst_expr(e, binding),
+        }
+    }
+    if let Some(tail) = &mut block.tail {
+        for e in tail {
+            subst_expr(e, binding);
+        }
+    }
+}
+
+fn subst_expr(expr: &mut Expr, binding: &HashMap<String, i64>) {
+    match expr {
+        Expr::Int(..) | Expr::Float(..) | Expr::Bool(..) | Expr::Str(..) => {}
+        // A shape constant is also a value: `for i in 0..N`.
+        Expr::Var(n, s) => {
+            if let Some(v) = binding.get(n) {
+                *expr = Expr::Int(*v, s.clone());
+            }
+        }
+        Expr::Unary(_, a, _) => subst_expr(a, binding),
+        Expr::Binary(_, a, b, _) => {
+            subst_expr(a, binding);
+            subst_expr(b, binding);
+        }
+        Expr::Call { type_args, args, .. } => {
+            for t in type_args {
+                *t = subst_type(t, binding);
+            }
+            for a in args {
+                subst_expr(a, binding);
+            }
+        }
+        Expr::If {
+            cond,
+            then_block,
+            else_block,
+            ..
+        } => {
+            subst_expr(cond, binding);
+            subst_block(then_block, binding);
+            if let Some(b) = else_block {
+                subst_block(b, binding);
+            }
+        }
+        Expr::For {
+            lb,
+            ub,
+            step,
+            iter,
+            body,
+            ..
+        } => {
+            subst_expr(lb, binding);
+            subst_expr(ub, binding);
+            if let Some(s) = step {
+                subst_expr(s, binding);
+            }
+            for it in iter {
+                subst_expr(&mut it.init, binding);
+            }
+            subst_block(body, binding);
+        }
+        Expr::Map {
+            inputs, body, ..
+        } => {
+            for i in inputs {
+                subst_expr(i, binding);
+            }
+            subst_block(body, binding);
+        }
+        Expr::Reduce {
+            input,
+            init,
+            body,
+            ..
+        } => {
+            subst_expr(input, binding);
+            subst_expr(init, binding);
+            subst_block(body, binding);
+        }
+        Expr::Extract { tensor, indices, .. } => {
+            subst_expr(tensor, binding);
+            for i in indices {
+                subst_expr(i, binding);
+            }
+        }
+        Expr::Insert {
+            tensor,
+            indices,
+            value,
+            ..
+        } => {
+            subst_expr(tensor, binding);
+            for i in indices {
+                subst_expr(i, binding);
+            }
+            subst_expr(value, binding);
+        }
+        Expr::Field { recv, .. } => subst_expr(recv, binding),
+        Expr::StructLit { fields, .. } => {
+            for (_, e) in fields {
+                subst_expr(e, binding);
+            }
+        }
+        Expr::With { recv, updates, .. } => {
+            subst_expr(recv, binding);
+            for (_, e) in updates {
+                subst_expr(e, binding);
+            }
+        }
+        Expr::Method { recv, args, .. } => {
+            subst_expr(recv, binding);
+            for a in args {
+                subst_expr(a, binding);
+            }
+        }
+    }
+}
+
+#[allow(dead_code)]
 pub fn check(prog: &Program) -> Result<TProgram, Error> {
     Checker::new().check(prog)
+}
+
+/// Like [`check`], but reports every error that the checker found (one per
+/// function that failed, plus any structural error).
+pub fn check_all(prog: &Program) -> Result<TProgram, Vec<Error>> {
+    Checker::new().check_all(prog)
 }
 
 #[cfg(test)]
