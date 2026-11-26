@@ -262,7 +262,9 @@ collected until the statement ends and the `.pt` archive is then written.
 
 ### Builtins
 
-`print(x)` prints a scalar, `print_byte(x)` writes one byte and `mlr.save_pt`
+`print("text", x, ...)` writes its pieces in order — a string literal as is, a
+scalar formatted by its type — and ends with a newline; a lone `print(x)` still
+prints one value per line. `print_byte(x)` writes one byte and `mlr.save_pt`
 writes a checkpoint; these are the only impure operations. The scalar
 functions are `exp`, `ln`, `sqrt`, `tanh`, `sigmoid` and `gelu`.
 

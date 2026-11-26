@@ -1,5 +1,7 @@
 # MLR
 
+[English](README.md) · [繁體中文](README.tw.md)
+
 MLR is a high level programming language that compiles to
 [MLIR](https://mlir.llvm.org/).
 
@@ -40,6 +42,51 @@ func.func @sum_to(%arg0: i32) -> i32 {
   func.return %4 : i32
 }
 ```
+
+## Design
+
+MLR's defining property is that the **source language is isomorphic to MLIR's IR
+model**, so lowering is a structural mapping rather than a reconstruction:
+
+* every compound construct (`if`, `for`, `map`, `reduce`) is a region that ends
+  in a `yield`, and becomes the region of an `scf.*` operation;
+* every binding is an immutable SSA value — there is no `var` and no
+  reassignment;
+* a tensor's shape is part of its type (`Tensor<64x128xf32>` ↔
+  `tensor<64x128xf32>`).
+
+Values are immutable: `tensor.insert` produces a **new** tensor value. The
+"in-place" writes seen lower down are a Stage 4 bufferization optimisation —
+when the old value is not read again, its buffer is reused. Mutation is an
+implementation detail, not a language feature. Memory is handled the same way:
+SSA last-use tells the compiler when a buffer can be reused or released, so
+there is no manual memory management and no borrow checker.
+
+**Strings** are the one deliberate exception. There is no string *type*, only
+string **literals**, used as file names, shell commands and messages. `print`
+takes literals and scalars together and formats them:
+
+```mlr
+print("n = ", n, ", twice = ", n * 2)
+```
+
+Anything that needs a real string value — reading text back, concatenating,
+building a path at run time — is delegated to the shell bridge (`exec*`), which
+returns numbers and tensors. A string type would mean dynamic lengths and heap
+lifetimes that conflict with the static-shape, MLIR-isomorphic design, so it is
+intentionally out of scope for now (see [doc/lib.md](doc/lib.md) §0 and
+[doc/roadmap.md](doc/roadmap.md)).
+
+Other practical traits:
+
+* the compiler is a **zero-dependency** Rust program with its own IR that
+  mirrors MLIR (verifier and printer included), emitting MLIR **text**;
+* training is built in: `value_and_grad` differentiates a function with reverse
+  mode automatic differentiation;
+* real checkpoints (`.pt`, safetensors, `hf://`) are embedded at compile time
+  (`mlr.load`) and written back at run time (`mlr.save_pt`);
+* the same program links against either the CPU runtime or the Metal
+  Performance Shaders runtime, which share one interface.
 
 ## Build
 

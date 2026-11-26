@@ -219,6 +219,14 @@ impl DomainOp {
     }
 }
 
+/// One piece of a `print(...)` call: a string literal is written as is, a
+/// scalar value is formatted according to its type.
+#[derive(Clone, Debug)]
+pub enum PrintPart {
+    Str(String),
+    Value(TExpr),
+}
+
 #[derive(Clone, Debug)]
 pub enum TExpr {
     ConstInt(i64, CType),
@@ -331,6 +339,11 @@ pub enum TExpr {
         updates: Vec<(usize, TExpr)>,
         ty: CType,
     },
+    /// `print("text", value, ...)`: a sequence of string literals and scalar
+    /// values, written to the standard output followed by a newline.
+    Print {
+        parts: Vec<PrintPart>,
+    },
 }
 
 impl TExpr {
@@ -357,6 +370,7 @@ impl TExpr {
             TExpr::Struct { ty, .. } => ty.clone(),
             TExpr::Field { ty, .. } => ty.clone(),
             TExpr::With { ty, .. } => ty.clone(),
+            TExpr::Print { .. } => CType::Void,
         }
     }
 
@@ -3511,20 +3525,25 @@ impl Checker {
                 return self.check_domain(name, args, span);
             }
             "print" => {
-                if args.len() != 1 {
-                    return err("`print` takes exactly one argument", span);
+                if args.is_empty() {
+                    return err("`print` takes at least one argument", span);
                 }
-                let a = self.check_expr(&args[0])?;
-                let t = a.ty();
-                if !matches!(t, CType::Scalar(_)) {
-                    return err(format!("`print` cannot print {}", t.print()), span);
+                let mut parts = Vec::with_capacity(args.len());
+                for arg in args {
+                    // A string literal is printed as is; it never becomes a
+                    // value, so it does not need a string type.
+                    if let Expr::Str(text, _) = arg {
+                        parts.push(PrintPart::Str(text.clone()));
+                        continue;
+                    }
+                    let a = self.check_expr(arg)?;
+                    let t = a.ty();
+                    if !matches!(t, CType::Scalar(_)) {
+                        return err(format!("`print` cannot print {}", t.print()), span);
+                    }
+                    parts.push(PrintPart::Value(a));
                 }
-                return Ok(TExpr::Call {
-                    name: name.to_string(),
-                    type_args: vec![],
-                    args: vec![a],
-                    ret: CType::Void,
-                });
+                return Ok(TExpr::Print { parts });
             }
             // The scalar functions of the runtime library.
             // The scalar functions of the runtime library; every one has a

@@ -308,6 +308,25 @@ fn main() {
 }
 
 #[test]
+fn prints_strings_and_values() {
+    let Some(out) = run(r#"
+fn main() {
+    let n = 3
+    print("n = ", n, ", twice = ", n * 2, "!")
+    print("plain")
+}
+"#)
+    else {
+        eprintln!("skipping: the LLVM tool chain is not available");
+        return;
+    };
+    assert_eq!(
+        out.lines().collect::<Vec<_>>(),
+        vec!["n = 3, twice = 6!", "plain"]
+    );
+}
+
+#[test]
 fn runs_a_tensor_program() {
     let Some(out) = run(r#"
 fn scale(x: Tensor<4xf32>, s: f32) -> Tensor<4xf32> {

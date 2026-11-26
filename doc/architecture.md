@@ -72,7 +72,7 @@ The IR comes with
 | `+ - * / %`             | `arith.addi` / `addf` / ...               |
 | `== != < <= > >=`       | `arith.cmpi` / `arith.cmpf`               |
 | `&& \|\| !`             | `arith.andi` / `ori` / `xori`             |
-| `print`                 | `func.call @mlr_print_*`                  |
+| `print`                 | `func.call @mlr_print_*`; string literals become globals (`mlr.print_str` → `@mlr_print_str`) |
 | `tensor.empty`          | `tensor.empty`                            |
 | `tensor.extract`        | `tensor.extract`                          |
 | `matmul` and friends    | `mlr.matmul` (generic form)               |

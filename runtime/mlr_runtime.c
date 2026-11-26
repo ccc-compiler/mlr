@@ -16,11 +16,15 @@
 #include <stdlib.h>
 #include <string.h>
 
-void mlr_print_i32(int x) { printf("%d\n", x); }
-void mlr_print_i64(long long x) { printf("%lld\n", x); }
-void mlr_print_f32(float x) { printf("%f\n", (double)x); }
-void mlr_print_f64(double x) { printf("%f\n", x); }
-void mlr_print_bool(int32_t x) { printf("%s\n", x ? "true" : "false"); }
+/* `print(a, b, ...)` writes each piece without a separator and ends the group
+ * with `mlr_print_nl`; a single `print(x)` therefore still ends in a newline. */
+void mlr_print_i32(int x) { printf("%d", x); }
+void mlr_print_i64(long long x) { printf("%lld", x); }
+void mlr_print_f32(float x) { printf("%f", (double)x); }
+void mlr_print_f64(double x) { printf("%f", x); }
+void mlr_print_bool(int32_t x) { printf("%s", x ? "true" : "false"); }
+void mlr_print_str(const char *s) { fputs(s, stdout); }
+void mlr_print_nl(void) { fputc('\n', stdout); }
 
 /* Writes a single byte, used by the language models that generate text. */
 void mlr_print_byte(int32_t x) { fputc((int)(x & 0xff), stdout); }

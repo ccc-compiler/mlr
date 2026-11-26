@@ -311,6 +311,11 @@ const RUNTIME: &[RuntimeFn] = &[
         result: None,
     },
     RuntimeFn {
+        name: "mlr_print_str",
+        params: &["index"],
+        result: None,
+    },
+    RuntimeFn {
         name: "mlr_tmin_grad",
         params: &["index", "index", "index", "index", "index", "index"],
         result: None,
@@ -618,6 +623,7 @@ fn lower_ops(
                 lower_load_runtime(op, used, &mut out, globals, counter)
             }
             "mlr.assert" => lower_assert(op, used, &mut out, globals, counter),
+            "mlr.print_str" => lower_print_str(op, used, &mut out, globals, counter),
             "mlr.zeros" => lower_zeros(op, used, &mut out),
             "mlr.add" => lower_add_elem(op, used, &mut out),
             "mlr.matmul_grad" => lower_matmul_grad(op, used, &mut out),
@@ -2476,6 +2482,29 @@ fn lower_assert(
     let mut call = Op::new("func.call");
     call.attrs.push(("callee".into(), Attr::Str("mlr_assert".into())));
     call.operands = vec![c32, pm];
+    out.push(call);
+}
+
+/// A string literal of a `print(...)` call: the text lives in a global buffer
+/// and is written by `mlr_print_str`.
+fn lower_print_str(
+    op: Op,
+    used: &mut Vec<&'static str>,
+    out: &mut Vec<Op>,
+    globals: &mut Vec<crate::ir::Global>,
+    counter: &mut usize,
+) {
+    used.push("mlr_print_str");
+    let text = match op.attr("text") {
+        Some(Attr::Str(s)) => s.clone(),
+        _ => String::new(),
+    };
+    let mut l = Lowerer { b: Builder::new() };
+    let p = l.string_ptr(globals, counter, &text, out);
+    let mut call = Op::new("func.call");
+    call.attrs
+        .push(("callee".into(), Attr::Str("mlr_print_str".into())));
+    call.operands = vec![p];
     out.push(call);
 }
 

@@ -6,7 +6,7 @@
 use std::collections::HashMap;
 
 use crate::ast::{AttrValue, BinOp};
-use crate::check::{CType, TBlock, TExpr, TFunc, TProgram, TStmt};
+use crate::check::{CType, PrintPart, TBlock, TExpr, TFunc, TProgram, TStmt};
 use crate::ir::{self, Attr, Builder, Dim, Loc, Op, Region, Type, Value};
 
 /// Converts a checked type into an IR type.
@@ -99,6 +99,13 @@ impl IrBuilder {
 
     fn fresh(&mut self, ty: Type) -> Value {
         self.b.fresh_value(ty)
+    }
+
+    /// Records a runtime function so that `build` declares it once.
+    fn declare_runtime(&mut self, name: &str) {
+        if !self.runtime.iter().any(|r| r == name) {
+            self.runtime.push(name.to_string());
+        }
     }
 
     fn lookup(&self, name: &str) -> Option<Value> {
@@ -225,6 +232,7 @@ impl IrBuilder {
                 "mlr_print_f64" => (vec![t("f64")], vec![]),
                 "mlr_print_byte" => (vec![t("i32")], vec![]),
                 "mlr_print_bool" => (vec![t("i1")], vec![]),
+                "mlr_print_nl" => (vec![], vec![]),
                 "mlr_exp" | "mlr_ln" | "mlr_sqrt" | "mlr_tanh" | "mlr_sigmoid"
                 | "mlr_gelu" | "mlr_abs" | "mlr_floor" | "mlr_ceil" | "mlr_round"
                 | "mlr_sign" => (vec![t("f32")], vec![t("f32")]),
@@ -657,6 +665,45 @@ impl IrBuilder {
                 self.emit(o);
                 res
             }
+            TExpr::Print { parts } => {
+                for part in parts {
+                    match part {
+                        PrintPart::Str(text) => {
+                            // Lowered to a runtime call with a string global in
+                            // stage 5, like `assert`'s message.
+                            let mut o = Op::new("mlr.print_str");
+                            o.generic = true;
+                            o.attrs.push(("text".into(), Attr::Str(text.clone())));
+                            self.emit(o);
+                        }
+                        PrintPart::Value(value) => {
+                            let v = self.expr(value);
+                            let fname = match &v.ty {
+                                Type::Scalar(k) => match k.name() {
+                                    "i1" | "bool" => "mlr_print_bool",
+                                    "i32" => "mlr_print_i32",
+                                    "i64" => "mlr_print_i64",
+                                    "f32" => "mlr_print_f32",
+                                    "f64" => "mlr_print_f64",
+                                    _ => "mlr_print_i32",
+                                },
+                                _ => "mlr_print_i32",
+                            };
+                            self.declare_runtime(fname);
+                            let mut o = Op::new("func.call");
+                            o.attrs.push(("callee".into(), Attr::Str(fname.into())));
+                            o.operands.push(v);
+                            self.emit(o);
+                        }
+                    }
+                }
+                self.declare_runtime("mlr_print_nl");
+                let mut nl = Op::new("func.call");
+                nl.attrs
+                    .push(("callee".into(), Attr::Str("mlr_print_nl".into())));
+                self.emit(nl);
+                self.fresh(Type::Void)
+            }
             TExpr::Sys { kind, cmd, args, ty } => {
                 let name = match kind {
                     crate::check::SysKind::Exec => "mlr.exec",
@@ -919,28 +966,6 @@ impl IrBuilder {
         }
         let name = name.as_str();
         match name {
-            "print" => {
-                let v = self.expr(&args[0]);
-                let fname = match &v.ty {
-                    Type::Scalar(k) => match k.name() {
-                        "i1" | "bool" => "mlr_print_bool",
-                        "i32" => "mlr_print_i32",
-                        "i64" => "mlr_print_i64",
-                        "f32" => "mlr_print_f32",
-                        "f64" => "mlr_print_f64",
-                        _ => "mlr_print_i32",
-                    },
-                    _ => "mlr_print_i32",
-                };
-                if !self.runtime.contains(&fname.to_string()) {
-                    self.runtime.push(fname.to_string());
-                }
-                let mut o = Op::new("func.call");
-                o.attrs.push(("callee".into(), Attr::Str(fname.into())));
-                o.operands.push(v);
-                self.emit(o);
-                return self.fresh(Type::Void);
-            }
             // The scalar functions of the runtime library.
             "mlr_exp" | "mlr_ln" | "mlr_sqrt" | "mlr_tanh" | "mlr_sigmoid" | "mlr_gelu"
             | "mlr_print_byte" => {
@@ -1458,6 +1483,7 @@ fn body_is_impure(block: &TBlock) -> bool {
                 expr_impure(recv) || updates.iter().any(|(_, v)| expr_impure(v))
             }
             TExpr::Sys { .. } => true,
+            TExpr::Print { .. } => true,
             _ => false,
         }
     }
