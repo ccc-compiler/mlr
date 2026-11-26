@@ -1,6 +1,7 @@
 # 設計提案：MLR 的改良路線（v0.3）
 
-> 狀態：**步驟 1–4 已完成**（v0.2）；§5 平行化與 §6 表驅動重構待做。
+> 狀態：**已完成**（v0.2）。步驟 1–4 已實作；§5 與 §6 經評估標記為
+> **不重要，不做**——現有範例的規模下沒有效能或維護上的需要。
 >
 > 完成記錄：
 > * §1 NaN bug——確認已在 bufferize 的 const/params 排除中修復，補了兩個
@@ -168,59 +169,32 @@ let w = mlr.load_runtime<Tensor<50257x768xf32>>("hf://openai-community/gpt2/mode
 
 ---
 
-## 5. 平行化（效能）
+## 5. 平行化（效能）——**不重要，不做**
 
-### 問題
+### 當時的問題
 
-CPU runtime 全單執行緒；MPS 只接了前向的 matmul/conv2d。訓練的
-反向（GEMM）與所有元素級運算都在單執行緒的 C 迴圈裡。
+CPU runtime 全單執行緒；MPS 只接了前向的 matmul/conv2d。
 
-### 做法（分三步，各自獨立可交）
+### 為何不做
 
-1. **編譯旗標**：`scripts/run.sh` 加 `-O2 -ffast-math`（數值容許）與
-   `-march=native`——零風險，先量一次 baseline。
-2. **OpenMP**：給重的 kernel（`mlr_matmul`、`mlr_matmul_grad`、
-   `mlr_conv2d*`）加 `#pragma omp parallel for`；run.sh 加
-   `-Xclang -fopenmp`（Apple clang 內建）。元素級與縮減不動（成本低）。
-3. **MPS 反向**：`mlr_matmul_grad` 的兩個 GEMM 換成
-   `MPSMatrixMultiplication`（`mlr_runtime_mps.mm` 的 rename 機制已支援，
-   與前向同一套）。
-
-### 驗收
-
-`examples/train/train_mnist_full.mlr` 的 200 步耗時（`now_ms()` 量）
-基線 vs 各步；數值與單執行緒版一致（ 相對誤差 < 1e-5，fast-math 除外
-——先用基準測試確認誤差再決定要不要 ffast-math）。
+現有模型（最大 784×128×64×10）與訓練步數下，單執行緒執行都在
+毫秒到秒級——沒有可量測的痛點。等真的訓練 GPT 級寬度、萬步以上的
+訓練時，再按當時的狀況做（旗標 → OpenMP → MPS 反向的三步計畫保留
+在 git 歷史）。
 
 ---
 
-## 6. `runtime_ops.rs` 表驅動重構（工程衛生）
+## 6. `runtime_ops.rs` 表驅動重構——**不重要，不做**
 
-### 問題
+### 當時的問題
 
-17+ 個 `lower_*` 函式 90% 是同一個樣板：alloc 結果、取運算元指標、
-常數、`func.call`。加一個 op 要寫 40 行重複程式。
+17+ 個 `lower_*` 函式 90% 是同一個樣板，加一個 op 要寫 40 行重複程式。
 
-### 做法
+### 為何不做
 
-宣告表取代手寫函式：
-
-```rust
-struct LowerSpec {
-    name: &'static str,          // domain op
-    kernel: &'static str,        // runtime 函式
-    // 每個參數：Tensor（取指標）、Scalar（直接）、Count（元素數）、
-    // Alloc（配置結果）、Attr(n)（屬性 p0…）
-    params: &'static [Param],
-}
-```
-
-`lower_domain_op` 依表產生 IR。RUNTIME 宣告表與 `LowerSpec` 合併
-（型別順序本來就要一致——這次多個 bug 正是兩張表不同步）。
-
-### 驗收
-
-行數減半（量測）；`cargo test` 與 `run_all` 全綠；之後加 op 只寫表。
+純維護性改善，不影響功能；重寫 30 個現有 lowering 的風險（每個都有
+ABI 與型別細節）大於省下的力氣。等下次需要大量新增 op 時，直接以
+表驅動的方式寫新的即可。
 
 ---
 
